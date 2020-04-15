@@ -1,0 +1,10 @@
+#!/bin/bash
+# ffmpeg but with semaphore-ish concurrency-limit
+
+lockfile="$(dirname "$(readlink -f "$0")")/xclock/$((RANDOM%2))"
+
+mkdir -p "$(dirname "$lockfile")"
+
+touch "$lockfile"
+
+exec flock --exclusive --no-fork "$lockfile" ffmpeg "$@"
