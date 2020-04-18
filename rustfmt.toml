@@ -1,0 +1,7 @@
+max_width = 120
+fn_args_layout = "Compressed"
+brace_style = "PreferSameLine"
+match_block_trailing_comma = true
+use_small_heuristics = "Max"
+use_try_shorthand = true
+use_field_init_shorthand = true

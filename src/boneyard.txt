@@ -1,0 +1,144 @@
+
+fn is_nonempty(s: &impl AsRef<str>) -> bool { !s.as_ref().trim().is_empty() }
+fn nonempty_lines<'b, 'a: 'b>(s: &'a str) -> impl Iterator<Item=&'b str> { s.lines().filter(is_nonempty).map(str::trim) }
+fn nonempty_par_lines<'b, 'a: 'b>(s: &'a str) -> impl rayon::prelude::ParallelIterator<Item=&'b str> {
+    use rayon::prelude::*;
+    s.par_lines().filter(is_nonempty).map(str::trim)
+}
+
+fn upsert_file<C: AsRef<[u8]>>(path: impl AsRef<Path>, contents: impl FnOnce() -> C) -> std::io::Result<bool> {
+    let q = !path.as_ref().is_file();
+    (if q { std::fs::write(path, contents()) } else { Ok(()) }).map(|()| q)
+}
+
+pub fn upsert_dir<'a>(path: &'a Path) -> std::io::Result<bool> {
+    let q = !path.is_dir();
+    (if q { std::fs::create_dir(path) } else { Ok(()) }).map(|()| q)
+}
+
+fn range_last(v: &[impl std::any::Any], n: usize) -> impl std::ops::RangeBounds<usize> { v.len().saturating_sub(n).. }
+
+fn compose_path(base: &Path, name: &str, ext: &str) -> PathBuf { let mut p = base.join(name); p.set_extension(ext); p }
+
+#[allow(dead_code)]
+fn fix_tags(mp3file: impl AsRef<Path>, album_title: &str) -> id3::Result<()> {
+    let mut tag = id3::Tag::read_from_path(&mp3file)?;
+    let mut changed = false;
+    let old_album = tag.album();
+    let new_album = tag.album().unwrap_or(album_title).trim().trim_end_matches(" - Topic");
+    if old_album != Some(new_album) { let new_album = new_album.to_owned(); tag.set_album(new_album); changed = true; }
+    let old_artist = tag.artist();
+    let new_artist = tag.artist().map(|s| s.trim().trim_end_matches(" - Topic"));
+    if old_artist != new_artist { if let Some(new_artist) = new_artist { let new_artist = new_artist.to_owned(); tag.set_artist(new_artist); changed = true; } }
+    if changed {
+        tag.write_to_path(&mp3file, id3::Version::Id3v24)?;
+    }
+    Ok(())
+}
+
+fn youtube_dl_anger(url: impl AsRef<str>, dl_archive: impl AsRef<Path>, base: impl AsRef<Path>) -> Result<duct::Expression> {
+    static YOUTUBE_DL_ANGER: &[&'static str] = &[
+        "--ffmpeg-location", "\\", "--download-archive", "\\",
+        "-xik", "--playlist-random", "-f", "bestaudio", "--audio-format", "mp3",
+        "--audio-quality", "0", "--add-metadata", "--external-downloader", "aria2c",
+        "--write-info-json"];
+    let mut args: Vec<&str> = Vec::with_capacity(YOUTUBE_DL_ANGER.len() + 1);
+    let temp = base.as_ref().join("ffmpeg").try_into_string()?;
+    args.extend(YOUTUBE_DL_ANGER.clone());
+    args[1] = &temp;
+    args[3] = dl_archive.as_ref().try_to_str()?;
+    args.push(url.as_ref().into());
+    Ok(cmd("youtube-dl", args))
+}
+
+fn youtube_dl_flat_info(url: impl AsRef<str>) -> duct::Expression {
+    static YOUTUBE_DL_INFO: &[&'static str] = &["--flat-playlist", "-J"];
+    let mut args: Vec<&str> = Vec::with_capacity(YOUTUBE_DL_INFO.len() + 1);
+    args.extend(YOUTUBE_DL_INFO.clone());
+    args.push(url.as_ref().into());
+    cmd("youtube-dl", args)
+}
+
+
+pub fn read_to_string<'a>(buf: &'a mut String, path: impl AsRef<Path>) -> std::io::Result<&'a mut String> {
+    *buf = std::fs::read_to_string(path)?; Ok(buf)
+}
+
+pub fn id_from_url<'b, 'a: 'b>(url: &'a str) -> Option<&'b str> {
+    if url.is_empty() { return None; }
+    if url.contains(|c| c == '#' || c == ';') {
+        info!("Skipping as the following is a comment: {:?}", url);
+        return None;
+    }
+    let ret = url.rsplitn(2, "playlist?list=").next();
+    if ret.is_none() {
+        info!("Skipping as the following is not a playlist: {:?}", url);
+    }
+    ret
+}
+
+pub fn download_playlist<'a, 'b, 'c>(playlist_url: &'a str, base: &'c Path) -> Result<()> {
+    let playlist_id = match id_from_url(playlist_url) {
+        Some(x) => x,
+        None => return Ok(()),
+    };
+    let done_ids_buf = {
+        let path = compose_path(base, playlist_id, "done.txt");
+        if path.is_file() { std::fs::read_to_string(path)? } else { String::new() }
+    };
+    let reject_ids_buf = std::fs::read_to_string(base.join("rejects.txt"))?;
+    let done_ids = nonempty_lines(&done_ids_buf).filter_map(|s: &str| s.split_whitespace().nth(1)).collect::<BTreeSet<&str>>();
+    let pl_data = get_playlist_info(playlist_url, playlist_id, &base)?;
+    let reject_ids = nonempty_lines(&reject_ids_buf).collect::<BTreeSet<&str>>();
+    let pl_ids = pl_data.entries.iter().map(|e| &*e.id).collect::<BTreeSet<_>>().difference(&reject_ids).cloned().collect::<BTreeSet<&str>>();
+    // upsert_file(compose_path(base, playlist_id, "title.txt"), || &pl_data.title)?;
+    if !upsert_file(compose_path(base, playlist_id, "todo.txt"), || pl_ids.iter().cloned().collect::<Vec<_>>().join("\n"))? {
+        let old_todos_buf = std::fs::read_to_string(compose_path(base, playlist_id, "todo.txt"))?;
+        let old_todos = nonempty_lines(&old_todos_buf).collect::<BTreeSet<_>>().difference(&reject_ids).cloned().collect::<BTreeSet<&str>>();
+        if pl_ids.difference(&old_todos).next().is_some() {
+            std::fs::write(compose_path(base, playlist_id, "todo.txt"), pl_ids.union(&old_todos).cloned().collect::<Vec<_>>().join("\n"))?;
+        }
+    }
+    let mut todos: Vec<String> = pl_ids.difference(&done_ids).map(|&s| format!("https://www.youtube.com/watch?v={}", s)).collect::<Vec<_>>();
+    todos.shuffle(&mut thread_rng());
+    info!("Attempting to download {} items", todos.len());
+    let mut cmds = todos.into_iter().map(|url| youtube_dl_anger(&url, compose_path(base, playlist_id, "done.txt"), base)).collect::<Result<Vec<duct::Expression>>>()?;
+
+    while !cmds.is_empty() {
+        cmds.drain(range_last(&cmds, 8)).map(|c| c.start()).collect::<Result<Vec<duct::Handle>, _>>()?
+            .drain(..).try_for_each(|j| -> Result<()> { j.wait()?; Ok(()) })?;
+    }
+
+    use rayon::prelude::*;
+    pl_data.entries.par_iter().try_for_each(|entry| -> Result<_> { Ok(fix_tags(entry.filename(), &pl_data.title)?) })?;
+
+    /*WalkBuilder::new(cwd).standard_filters(false).types({
+        let mut t = ignore::types::TypesBuilder::new();
+        t.add("mp3", "*.mp3")?;
+        t.select("mp3").build()?
+    }).build().try_for_each(|entry| -> Result<_> {
+        Ok(fix_tags(entry?.path(), &pl_data.title)?)
+    })?;*/
+
+    Ok(())
+}
+
+
+
+fn get_playlist_info<'a, 'b, 'c>(url: &'a str, playlist_id: &'b str, base: &'c Path) -> std::io::Result<YoutubePlaylist> {
+    let path = compose_path(base, playlist_id, "json");
+    if !path.exists() { youtube_dl_flat_info(url).stdout_file(File::create(&path)?).run()?; }
+    // else if p.exists() && !p.is_file() { /* keep calm, carry on and let the inevitable happen */ }
+    Ok(serde_json::from_reader(File::open(&path)?)?)
+}
+
+pub fn read_playlists_input<'b, 'a: 'b>(buf: &'a mut String, base: impl AsRef<Path>) -> Result<impl rayon::prelude::ParallelIterator<Item=&'b str>> {
+    *buf = std::fs::read_to_string(base.as_ref().join("music.txt"))?;
+    Ok(nonempty_par_lines(buf.as_str()))
+}
+
+let base = std::env::current_dir()?;
+base.to_str().ok_or_else(|| anyhow!("non-utf8 path"))?;
+use rayon::prelude::ParallelIterator;
+let mut playlist_buf = String::default();
+read_playlists_input(&mut playlist_buf, &base)?.try_for_each(|url| download_playlist(url, &base))?;
