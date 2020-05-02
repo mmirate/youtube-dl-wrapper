@@ -5,17 +5,15 @@ use crossbeam_utils::atomic::AtomicCell;
 use derivative::Derivative;
 use duct::cmd;
 use extension_trait::extension_trait;
-use itertools::Itertools;
 use kuchiki::traits::*;
 #[allow(unused_imports)]
 use log::{debug, error, info, warn, LevelFilter};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use serde::{self, Deserialize, Serialize};
-use serde_json::{self, Value};
 // use serde_bytes;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -53,11 +51,14 @@ enum StartingPointTag {
     Channel(Option<String>),
     Playlist,
 }
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug)]
+//#[derivative(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct StartingPoint<'a> {
+    /*#[derivative(Hash="ignore", PartialEq="ignore", PartialOrd="ignore", Ord="ignore")]*/
     pub(crate) url: Cow<'a, str>,
     pub(crate) id: &'a str,
-    path: PathBuf,
+    /*#[derivative(Hash="ignore", PartialEq="ignore", PartialOrd="ignore", Ord="ignore")]*/ path: PathBuf,
+    /*#[derivative(Hash="ignore", PartialEq="ignore", PartialOrd="ignore", Ord="ignore")]*/
     tag: StartingPointTag,
 }
 impl<'a> StartingPoint<'a> {
@@ -95,11 +96,12 @@ impl<'a> StartingPoint<'a> {
             x => bail!("invalid url: typ={:?}", x),
         })
     }
-    pub(crate) fn read(&self) -> Result<Option<YoutubePlaylists>> {
+    pub(crate) fn read(&mut self, rescrape: bool, use_cookies: bool, postprocess: bool) -> Result<Vec<TargetItem>> {
+        self.scrape(rescrape, use_cookies)?;
         info!("parsing {:?}", &self.path);
         match std::fs::File::open(&self.path) {
             Ok(rdr) => Ok({
-                let mut ret = match &self.tag {
+                let mut pls = match &self.tag {
                     StartingPointTag::Channel(_) => {
                         serde_json::from_reader(rdr).with_context(|| format!("cannot parse {:?}", &self.path))?
                     }
@@ -107,38 +109,46 @@ impl<'a> StartingPoint<'a> {
                         serde_json::from_reader(rdr).with_context(|| format!("cannot parse {:?}", &self.path))?,
                     ),
                 };
-                /*let out_path = self.path.with_extension("out.json");
-                let bytes = serde_json::to_vec(&ret)?;
-                duct::cmd("jq", &["--sort-keys", "."])
-                    .stdout_path(out_path)
-                    .stdin_bytes(bytes)
-                    .run()?;*/
-                if ret.read_progress()? == Progress::MAX {
-                    None
-                } else {
-                    for pl in &mut ret.entries {
-                        pl.sp_id = self.id.to_owned();
-                        for item in &mut pl.entries {
-                            if let Some(item) = item {
-                                item.sp_id = self.id.to_owned();
+                for pl in pls.entries.iter_mut() {
+                    for item in pl.entries.iter_mut() {
+                        if let Some(old_item) = item.as_mut() {
+                            if let Ok(new_item) = old_item.reread() {
+                                *old_item = new_item;
                             }
                         }
                     }
-                    Some(ret)
+                }
+                if let Some(progress) = pls.progress() {
+                    if progress == Progress::MAX || !postprocess && progress == Progress::Downloaded {
+                        info!("already processed {}", self.id);
+                        vec![]
+                    } else if progress < Progress::Downloaded
+                        && !rescrape
+                        && pls.expiry() < Some(Utc::now())
+                        && !pls.is_empty()
+                    {
+                        self.read(true, use_cookies, postprocess)?
+                    } else {
+                        pls.entries
+                            .into_par_iter()
+                            .flat_map(|pl| pl.entries)
+                            .flatten()
+                            .map(|t| {
+                                t.write()?;
+                                Ok(t)
+                            })
+                            .collect::<Result<_>>()?
+                    }
+                } else {
+                    info!("no items contained in {}", self.id);
+                    vec![]
                 }
             }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(e) => Err(e.into()),
         }
     }
-    pub(crate) fn amend(&self, new_value: &YoutubePlaylists) -> Result<()> {
-        info!("writing back {}", &self.url);
-        serde_json::to_writer_pretty(std::fs::File::create(&self.path)?, new_value).map_err(From::from)
-    }
-    #[allow(clippy::block_in_if_condition_stmt)]
-    pub(crate) fn scrape(
-        &mut self, pending_changes_tx: crossbeam_channel::Sender<String>, use_cookies: bool,
-    ) -> Result<()> {
+    fn get_shelf(&mut self) -> Result<()> {
         if let StartingPointTag::Channel(None) = self.tag {
             info!("need shelf for {:?}", self);
             let mut base = reqwest::Url::parse(&self.url)?;
@@ -155,7 +165,7 @@ impl<'a> StartingPoint<'a> {
                 resp.text()
             }?;
             let doc = kuchiki::parse_html().one(text.as_str());
-            if let Some(correct_url) =
+            if let Some((correct_url, correct_tag)) =
                 doc.select("*[href*=\"shelf_id=\"]").map_err(|()| anyhow!("CSS selector problem"))?.find_map(|e| {
                     if let Some(e) = e.as_node().as_element() {
                         if let Some(href) = e.attributes.borrow().get("href") {
@@ -167,7 +177,12 @@ impl<'a> StartingPoint<'a> {
                                         let other = StartingPoint::new(&url.as_str());
                                         if let Ok(other) = other {
                                             if self.id == other.id {
-                                                return Some(url.into_string());
+                                                if let StartingPointTag::Channel(Some(_)) = other.tag {
+                                                    let correct_tag = other.tag;
+                                                    return Some((url.into_string(), correct_tag));
+                                                } else {
+                                                    error!("{:?} has no shelf", other);
+                                                }
                                             } else {
                                                 error!("{:?} != {:?}", self, other);
                                             }
@@ -180,24 +195,33 @@ impl<'a> StartingPoint<'a> {
                     None
                 })
             {
-                let rhs = correct_url.clone();
-                let lhs = std::mem::replace(&mut self.url, correct_url.into()).into_owned();
+                let lhs = correct_url.clone();
+                let rhs = std::mem::replace(&mut self.url, correct_url.into()).into_owned();
+                std::mem::replace(&mut self.tag, correct_tag);
                 info!("found shelf: {} => {}", lhs, rhs);
-                pending_changes_tx.send(format!(
-                    "s#\\b{}$#{}#;\n",
-                    regex_syntax::escape(&lhs),
-                    regex_syntax::escape(&rhs)
-                ))?;
             } else {
                 bail!("couldn't find shelf for {:?} inside {}", self, text);
             }
         }
+        Ok(())
+    }
+    #[allow(clippy::block_in_if_condition_stmt)]
+    fn scrape(&mut self, rescrape: bool, use_cookies: bool) -> Result<()> {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&self.path) {
             Ok(out_file) => {
-                info!("scraping {:?}", self);
-                youtube_dl_to(&self.url, out_file, use_cookies)?
+                self.get_shelf()?;
+                info!("scraping {:?}", self.url);
+                youtube_dl_to_file(&self.url, out_file, use_cookies)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => info!("already scraped {:?}", self),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if rescrape {
+                    self.get_shelf()?;
+                    info!("rescraping {:?}", self.url);
+                    youtube_dl_to_path(&self.url, &self.path, use_cookies)?;
+                } else {
+                    info!("already scraped {:?}", self.url)
+                }
+            }
             Err(e) => return Err(e.into()),
         }
         Ok(())
@@ -216,6 +240,7 @@ fn youtube_dl_(url: &str, use_cookies: bool) -> duct::Expression {
         vec![]
     };
     args.extend_from_slice(&[
+        "-4",
         "-f",
         "bestaudio[protocol!=http_dash_segments]",
         "--youtube-skip-dash-manifest",
@@ -227,15 +252,19 @@ fn youtube_dl_(url: &str, use_cookies: bool) -> duct::Expression {
     ret
 }
 
-fn youtube_dl_to(url: &str, out_file: std::fs::File, use_cookies: bool) -> Result<()> {
-    Ok(youtube_dl_(url, use_cookies).stdout_file(out_file).unchecked().run().map(drop)?)
+fn youtube_dl_to_path(url: &str, out_file: &Path, use_cookies: bool) -> Result<()> {
+    Ok(youtube_dl_(url, use_cookies).unchecked().pipe(cmd!("ifne", "sponge", out_file)).run().map(drop)?)
+}
+
+fn youtube_dl_to_file(url: &str, out_file: std::fs::File, use_cookies: bool) -> Result<()> {
+    Ok(youtube_dl_(url, use_cookies).stdout_file(out_file).run().map(drop)?)
 }
 
 fn youtube_dl(url: &str, use_cookies: bool) -> Result<duct::ReaderHandle> {
     Ok(youtube_dl_(url, use_cookies).reader()?)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ItemId(pub u64);
 impl ToString for ItemId {
     fn to_string(&self) -> String {
@@ -281,25 +310,24 @@ impl Serialize for ItemId {
 }
 
 fn deserialize_ac<'de, D, T: Deserialize<'de> + Copy>(deserializer: D) -> Result<AtomicCell<T>, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        let input: T = Deserialize::deserialize(deserializer)?;
-        Ok(AtomicCell::new(input))
-    }
+where
+    D: serde::de::Deserializer<'de>,
+{
+    let input: T = Deserialize::deserialize(deserializer)?;
+    Ok(AtomicCell::new(input))
+}
 
-
-    fn serialize_ac<S, T: Serialize + Copy>(output: &AtomicCell<T>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        let output: T = output.load();
-        output.serialize(serializer)
-    }
+fn serialize_ac<S, T: Serialize + Copy>(output: &AtomicCell<T>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::ser::Serializer,
+{
+    let output: T = output.load();
+    output.serialize(serializer)
+}
 
 /*#[serde(flatten)] extra: HashMap<String, Value>,*/
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 struct UploaderDetails {
     uploader: String,
@@ -307,7 +335,7 @@ struct UploaderDetails {
     uploader_url: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 struct DiscriminantDetails {
     extractor: String,
@@ -327,7 +355,7 @@ pub(crate) enum Progress {
     Postprocessed,
 }
 impl Progress {
-    const MAX: Progress = Progress::Postprocessed;
+    pub(crate) const MAX: Progress = Progress::Postprocessed;
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -341,11 +369,11 @@ pub(crate) struct FormatDetails {
     acodec: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     container: Option<String>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    downloader_options: HashMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    downloader_options: BTreeMap<String, usize>,
     ext: String,
     filesize: Option<u64>,
-    http_headers: HashMap<String, String>,
+    http_headers: BTreeMap<String, String>,
     protocol: String,
     url: String,
     #[serde(default)]
@@ -355,7 +383,7 @@ pub(crate) struct FormatDetails {
     height: Option<u32>,
     width: Option<u32>,
     vcodec: String,
-    tbr: f64,
+    tbr: f64, //fixed::types::I10F54,
     // nomenclature
     format: String,
     format_id: String,
@@ -371,21 +399,21 @@ pub(crate) struct FormatDetails {
 #[serde(deny_unknown_fields)]
 struct TargetItemExt {
     age_limit: usize,
-    annotations: Value,
-    automatic_captions: Value,
-    average_rating: Value,
+    annotations: Option<BTreeMap<String, ()>>,
+    automatic_captions: BTreeMap<String, String>,
+    average_rating: Option<f64>, //Option<fixed::types::I4F60>,
     channel_id: String,
     channel_url: String,
-    categories: Value,
-    chapters: Value,
+    categories: Option<Vec<String>>,
+    chapters: Option<serde_json::Value>,
     dislike_count: Option<usize>,
     like_count: Option<usize>,
     display_id: String,
     duration: usize,
-    end_time: Value,
-    episode_number: Value,
+    end_time: Option<()>,
+    episode_number: Option<()>,
     is_live: Option<bool>,
-    license: Value,
+    license: Option<()>,
     playlist_index: Option<usize>,
     n_entries: Option<usize>,
     playlist_title: Option<String>,
@@ -393,20 +421,20 @@ struct TargetItemExt {
     playlist_uploader_id: Option<String>,
     release_date: Option<String>,
     release_year: Option<usize>,
-    requested_subtitles: Value,
-    season_number: Value,
-    series: Value,
-    start_time: Value,
-    subtitles: Value,
+    requested_subtitles: Option<()>,
+    season_number: Option<()>,
+    series: Option<()>,
+    start_time: Option<()>,
+    subtitles: Option<BTreeMap<String, ()>>,
     tags: Vec<String>,
     thumbnail: String,
-    thumbnails: Value,
+    thumbnails: Vec<BTreeMap<String, String>>,
     upload_date: String,
     view_count: usize,
 }
 
 #[derive(Derivative, Deserialize, Serialize)]
-#[derivative(Debug)]
+#[derivative(Debug/*, PartialEq, Eq, PartialOrd, Ord*/)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetItem {
     pub(crate) id: ItemId,
@@ -439,41 +467,20 @@ pub(crate) struct TargetItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[derivative(Debug = "ignore")]
     disc_number: Option<usize>,
-    #[derivative(Debug = "ignore")]
-    #[serde(skip)]
+    #[serde(default)]
+    #[serde(serialize_with = "serialize_ac", deserialize_with = "deserialize_ac")]
+    #[derivative(Debug = "ignore", PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
     progress: AtomicCell<Progress>,
     #[serde(flatten)]
     #[derivative(Debug = "ignore")]
     irrelevant: Box<TargetItemExt>,
     #[serde(flatten)]
-    #[derivative(Debug = "ignore")]
+    #[derivative(Debug = "ignore", PartialEq = "ignore", Ord = "ignore", PartialOrd = "ignore")]
     chosen_format: RwLock<FormatDetails>,
     #[serde(flatten)]
     discriminant: DiscriminantDetails,
     #[serde(flatten)]
     uploader: UploaderDetails,
-    #[serde(skip)]
-    sp_id: String,
-    #[serde(default)] #[serde(serialize_with="serialize_ac", deserialize_with="deserialize_ac")] pub(crate) dupe: AtomicCell<bool>,
-}
-impl Eq for TargetItem where String: Eq {}
-impl PartialEq for TargetItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.id.eq(&other.id)
-    }
-}
-impl Ord for TargetItem
-where
-    String: Eq,
-{
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-impl PartialOrd for TargetItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.id.partial_cmp(&other.id)
-    }
 }
 pub(crate) enum TargetItemQueueDownloadResult {
     AlreadyDownloaded,
@@ -487,47 +494,52 @@ impl TargetItem {
         ret.set_extension(extension);
         ret
     }
-    fn filename(&self) -> PathBuf {
+    fn download_filename(&self) -> PathBuf {
         self.filename_with_extension(&self.chosen_format.read().ext)
     }
-    fn filename_with_added_extension(&self, extension: impl AsRef<str>) -> PathBuf {
-        let mut ret = PathBuf::from(self.id.to_string());
-        let ext = self.chosen_format.read().ext.clone() + "." + extension.as_ref();
-        ret.set_extension(ext);
-        ret
+    fn info_filename(&self) -> PathBuf {
+        self.filename_with_extension("json")
     }
-    pub(crate) fn read_progress(&self) -> Result<Progress> {
-        {
-            let progress = self.progress.load();
-            if progress != Progress::Unknown {
-                return Ok(progress);
+    pub(crate) fn expiry(&self) -> Option<DateTime<Utc>> {
+        let cfg = self.chosen_format.upgradable_read();
+        let cfg = if cfg.url_expiry.is_none() {
+            if let Some(query_expiry) = reqwest::Url::parse(&cfg.url).ok().and_then(|url| {
+                url.query_pairs().collect::<BTreeMap<_, _>>().remove("expire").and_then(|s| s.parse().ok())
+            }) {
+                let mut cfg = RwLockUpgradableReadGuard::upgrade(cfg);
+                let query_expiry = Utc.timestamp(query_expiry, 0);
+                cfg.url_expiry = Some(query_expiry);
+                RwLockWriteGuard::downgrade_to_upgradable(cfg)
+            } else {
+                cfg
             }
+        } else {
+            cfg
+        };
+        cfg.url_expiry
+    }
+    fn reread(&self) -> Result<Self> {
+        let path = self.info_filename();
+        serde_json::from_reader(std::fs::File::open(path)?).map_err(From::from)
+    }
+    pub(crate) fn write(&self) -> Result<()> {
+        let path = self.info_filename();
+        let new_contents = serde_json::to_string_pretty(&self)?;
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            Ok(old_contents) if old_contents == new_contents => (),
+            _ => std::fs::write(path, new_contents)?,
         }
-        let status_path = &self.filename_with_extension("status.json");
-        let aria2_path = self.filename_with_added_extension("aria2");
-        self.progress.store(match std::fs::File::open(&status_path) {
-            Ok(rdr) => {
-                let ret: Progress = serde_json::from_reader(rdr)?;
-                if ret == Progress::Queued && aria2_path.is_file() {
-                    // std::fs::remove_file(status_path)?;
-                    Progress::Interrupted
-                } else {
-                    ret
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let ret = if aria2_path.is_file() { Progress::Interrupted } else { Default::default() };
-                serde_json::to_writer(std::fs::File::create(&status_path)?, &ret)?;
-                ret
-            }
-            Err(e) => return Err(e.into()),
-        });
-        Ok(self.progress.load())
+        Ok(())
     }
     pub(crate) fn write_progress(&self, new_value: Progress) -> Result<()> {
         self.progress.store(new_value);
-        let path = &self.filename_with_extension("status.json");
-        serde_json::to_writer(std::fs::File::create(&path)?, &new_value)?;
+        let path = &self.info_filename();
+        serde_json::to_writer_pretty(std::fs::File::create(&path)?, &self)?;
+        match std::fs::remove_file(&self.filename_with_extension("status.json")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            x => x,
+        }?;
         Ok(())
     }
     fn _refresh_if_needed<'s, 'g>(&'s self, cfg: &mut RwLockWriteGuard<'g, FormatDetails>) -> Result<()> {
@@ -583,7 +595,11 @@ impl TargetItem {
                     if query_expiry > Utc::now() {
                         cfg.url_expiry = Some(query_expiry);
                         (None, RwLockWriteGuard::downgrade_to_upgradable(cfg))
-                    } else if let Some(other) = serde_json::from_reader(youtube_dl(&self.webpage_url, use_cookies).context("youtube_dl callsite failed")?).context("serde_json failed")? {
+                    } else if let Some(other) = serde_json::from_reader(
+                        youtube_dl(&self.webpage_url, use_cookies).context("youtube_dl callsite failed")?,
+                    )
+                    .context("serde_json failed")?
+                    {
                         let other: Self = other;
                         let old_url = std::mem::replace(cfg.deref_mut(), other.chosen_format.into_inner()).url;
                         self._refresh_if_needed(&mut cfg)?;
@@ -591,8 +607,10 @@ impl TargetItem {
                     } else {
                         (None, RwLockWriteGuard::downgrade_to_upgradable(cfg))
                     }
-                } else if let Some(other) =
-                    serde_json::from_reader(youtube_dl(&self.webpage_url, use_cookies).context("youtube_dl callsite failed")?).context("serde_json failed")?
+                } else if let Some(other) = serde_json::from_reader(
+                    youtube_dl(&self.webpage_url, use_cookies).context("youtube_dl callsite failed")?,
+                )
+                .context("serde_json failed")?
                 {
                     let other: Self = other;
                     let old_url = std::mem::replace(cfg.deref_mut(), other.chosen_format.into_inner()).url;
@@ -620,8 +638,8 @@ impl TargetItem {
         &self, client: &reqwest::blocking::Client, use_cookies: bool,
     ) -> Result<TargetItemQueueDownloadResult> {
         {
-            let progress = self.read_progress()?;
-            if progress >= Progress::Queued {
+            let progress = self.progress.load();
+            if progress > Progress::Queued {
                 info!("not queueing {} since it is {:?}", self.id.to_string(), progress);
                 return Ok(AlreadyDownloaded);
             }
@@ -642,7 +660,7 @@ impl TargetItem {
                 dir: std::env::current_dir()?,
                 gid: self.id.into(),
                 header: headers.iter().map(String::as_str).collect(),
-                out: &self.filename().try_into_string()?,
+                out: &self.download_filename().try_into_string()?,
             },
         )
         .send_with(client)?;
@@ -658,94 +676,23 @@ impl TargetItem {
             aria2::TellStoppedParams::new().send()?.contents.result,
         ))
     }
-    #[allow(dead_code)]
-    fn poll_is_download_complete(&self, use_cookies: bool) -> Result<bool> {
-        let progress = self.progress.load();
-        if progress < Progress::Queued {
-            return Ok(false);
-        } else if progress >= Progress::Downloaded {
-            return Ok(true);
-        }
-        let gid = self.id.into();
-        let result = aria2::TellStatusParams::new(gid).send()?.contents.result;
-        use aria2::DownloadStatus::*;
-        Ok(match result.status {
-            Complete | Removed => {
-                aria2::RemoveResultParams::new(gid).send()?;
-                self.write_progress(Progress::Downloaded)?;
-                true
-            }
-            Error => bail!("download of {} failed: {}", self.id.to_string(), result.error_message),
-            Waiting | Paused => {
-                self.requeue_if_needed(use_cookies)?;
-                false
-            }
-            Active => false,
-        })
-    }
-    #[allow(dead_code)]
-    fn block_until_download_completion(&self, use_cookies: bool) -> Result<()> {
-        if self.progress.load() >= Progress::Downloaded {
-            return Ok(());
-        }
-        let json = aria2::TellStatusParams::new(self.id.into());
-        loop {
-            use aria2::DownloadStatus::*;
-            let result = json.send()?.contents.result;
-            match result.status {
-                Complete | Removed => {
-                    aria2::RemoveResultParams::new(self.id.into()).send()?;
-                    self.write_progress(Progress::Downloaded)?;
-                    return Ok(());
-                }
-                Error => bail!("download of {} failed: {}", self.id.to_string(), result.error_message),
-                Waiting | Paused => {
-                    self.requeue_if_needed(use_cookies)?;
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                }
-                Active => std::thread::sleep(std::time::Duration::from_secs(5)),
-            }
-        }
-    }
-    pub(crate) fn postprocess(&self) -> Result<()> {
+    pub(crate) fn dump_metadata(&self) -> Result<()> {
         {
             let progress = self.progress.load();
-            if progress >= Progress::Postprocessed || progress < Progress::Downloaded {
+            if progress >= Progress::Postprocessed && self.filename_with_extension("flac").is_file() {
+                self.write_progress(Progress::Downloaded)?;
+            // nah, don't remove the flac yet
+            } else if progress < Progress::Downloaded {
+                warn!("tried to postprocess {} before it was downloaded, ignoring", self.id.to_string());
                 return Ok(());
             }
         }
-        info!("postprocessing {}", self.id.to_string());
-        static DESIRED_EXT: &str = "flac";
-        static DESIRED_ACODEC: &str = "flac";
-        let input_filename = format!("file:{}", self.filename().try_into_string()?);
-        let output_filename = format!("file:{}", &self.filename_with_extension(DESIRED_EXT).try_into_string()?);
-        if input_filename == output_filename {
+        info!("dumping metadata for {}", self.id.to_string());
+        let input_filename = format!("file:{}", self.download_filename().try_into_string()?);
+        let metadata_filename = format!("file:{}", &self.filename_with_extension("ffmetadata").try_into_string()?);
+        if input_filename == metadata_filename {
             return Ok(());
         }
-        let input_acodec: String = {
-            static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-                regex::Regex::new(r#"(?m)^codec_name=(.+)$(?:.|\n)+?^codec_type=audio$"#).unwrap()
-            });
-            let buf = cmd(
-                "ffprobe",
-                &[
-                    //"-nostats",
-                    //"-nostdin",
-                    "-loglevel",
-                    "level+warning",
-                    "-hide_banner",
-                    "-show_streams",
-                    &input_filename,
-                ],
-            )
-            .stdout_capture()
-            .read()?;
-            RE.captures(&buf)
-                .map(|cs| cs[1].to_owned())
-                .with_context(|| format!("Cannot probe codec for {:?}", &self.id.to_string()))?
-        };
-        let output_acodec = if input_acodec == DESIRED_ACODEC { "copy" } else { DESIRED_ACODEC };
-
         let (metadata, metadata_count) = {
             let mut i = 0usize;
             let mut metadata = String::new();
@@ -805,7 +752,7 @@ impl TargetItem {
             (metadata, i)
         };
 
-        let mut ffmpeg_args = Vec::with_capacity(3 + metadata_count + 4);
+        let mut ffmpeg_args = Vec::with_capacity(8 + metadata_count + 4);
         ffmpeg_args.extend_from_slice(&[
             "-y",
             "-nostats",
@@ -817,7 +764,84 @@ impl TargetItem {
             &input_filename,
         ]);
         ffmpeg_args.extend(metadata.split_terminator('\0'));
-        ffmpeg_args.extend_from_slice(&["-vn", "-acodec", output_acodec, &output_filename]);
+        ffmpeg_args.extend_from_slice(&["-f", "ffmetadata", &metadata_filename]);
+
+        cmd("ffmpeg", ffmpeg_args).run()?;
+        Ok(())
+    }
+    pub(crate) fn postprocess(&self) -> Result<()> {
+        {
+            let progress = self.progress.load();
+            if progress < Progress::Downloaded {
+                warn!("tried to postprocess {} before it was downloaded, ignoring", self.id.to_string());
+                return Ok(());
+            } else if progress >= Progress::Postprocessed {
+                warn!("tried to postprocess {} in duplicate, ignoring", self.id.to_string());
+                return Ok(());
+            }
+        }
+        self.dump_metadata()?;
+        info!("postprocessing {}", self.id.to_string());
+        let output_directory = Path::new("remuxed");
+        match std::fs::create_dir(output_directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            x => x,
+        }?;
+        let input_filename = format!("file:{}", self.download_filename().try_into_string()?);
+        let metadata_filename = format!("file:{}", &self.filename_with_extension("ffmetadata").try_into_string()?);
+        let input_acodec: String = {
+            static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r#"(?m)^codec_name=(.+)$(?:.|\n)+?^codec_type=audio$"#).unwrap()
+            });
+            let buf = cmd(
+                "ffprobe",
+                &[
+                    "-loglevel",
+                    "level+warning",
+                    "-hide_banner",
+                    "-show_streams",
+                    &input_filename,
+                ],
+            )
+            .stdout_capture()
+            .read()?;
+            RE.captures(&buf)
+                .map(|cs| cs[1].to_owned())
+                .with_context(|| format!("Cannot probe codec for {:?}", &self.id.to_string()))?
+        };
+        let (output_ext, output_acodec) = match &*input_acodec {
+            "aac" => ("m4a", "copy"),
+            x @ "flac" => (x, "copy"),
+            x @ "mp3" => (x, "copy"),
+            "vorbis" => ("ogg", "copy"),
+            "opus" => ("mkv", "copy"),
+            _ => ("flac", "flac"),
+        };
+
+        let output_filename =
+            format!("file:{}", &output_directory.join(self.filename_with_extension(output_ext)).try_into_string()?);
+        if input_filename == output_filename {
+            return Ok(());
+        }
+
+        let ffmpeg_args = &[
+            "-y",
+            "-nostats",
+            "-nostdin",
+            "-loglevel",
+            "level+warning",
+            "-hide_banner",
+            "-i",
+            &input_filename,
+            "-i",
+            &metadata_filename,
+            "-map_metadata",
+            "1",
+            "-vn",
+            "-acodec",
+            output_acodec,
+            &output_filename,
+        ];
 
         cmd("ffmpeg", ffmpeg_args).run()?;
         self.write_progress(Progress::Postprocessed)?;
@@ -825,8 +849,9 @@ impl TargetItem {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Derivative, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[derivative(/*PartialEq, Eq, PartialOrd, Ord*/)]
 pub(crate) struct YoutubePlaylist {
     pub(crate) entries: Vec<Option<TargetItem>>,
     title: String,
@@ -836,36 +861,23 @@ pub(crate) struct YoutubePlaylist {
     uploader: Option<UploaderDetails>,
     #[serde(flatten)]
     discriminant: DiscriminantDetails,
-    #[serde(default)] #[serde(serialize_with="serialize_ac", deserialize_with="deserialize_ac")] pub(crate) dupe: AtomicCell<bool>,
-    #[serde(skip)]
-    sp_id: String,
-}
-impl Eq for YoutubePlaylist {}
-impl PartialEq for YoutubePlaylist {
-    fn eq(&self, other: &Self) -> bool {
-        self.id.eq(&other.id)
-    }
-}
-impl Ord for YoutubePlaylist {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-impl PartialOrd for YoutubePlaylist {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.id.partial_cmp(&other.id)
-    }
 }
 impl YoutubePlaylist {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
-    pub(crate) fn read_progress(&self) -> Result<Progress> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub(crate) fn expiry(&self) -> Option<DateTime<Utc>> {
+        self.entries.iter().flatten().map(|item| item.expiry()).flatten().max()
+    }
+    pub(crate) fn progress(&self) -> Option<Progress> {
         self.entries
             .par_iter()
             .flatten()
-            .map(TargetItem::read_progress)
-            .reduce(|| Ok(Progress::MAX), |x, y| Ok(std::cmp::min(x?, y?)))
+            .map(|t| t.progress.load())
+            .min()
     }
 }
 
@@ -882,65 +894,24 @@ pub(crate) struct YoutubePlaylists {
     discriminant: DiscriminantDetails,
 }
 impl YoutubePlaylists {
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.iter().map(YoutubePlaylist::len).sum()
     }
-    pub(crate) fn read_progress(&self) -> Result<Progress> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.iter().all(YoutubePlaylist::is_empty)
+    }
+    pub(crate) fn expiry(&self) -> Option<DateTime<Utc>> {
+        self.entries.iter().map(YoutubePlaylist::expiry).flatten().max()
+    }
+    pub(crate) fn progress(&self) -> Option<Progress> {
         self.entries
             .par_iter()
-            .map(YoutubePlaylist::read_progress)
-            .reduce(|| Ok(Progress::MAX), |x, y| Ok(std::cmp::min(x?, y?)))
+            .map(YoutubePlaylist::progress)
+            .flatten()
+            .min()
     }
     fn singleton_from_playlist(playlist: YoutubePlaylist) -> Self {
         YoutubePlaylists { entries: vec![playlist], ..Default::default() }
     }
-    pub(crate) fn find_dupes<'a>(input: impl IntoParallelIterator<Item = &'a Self>) -> Result<std::collections::BTreeSet<String>> {
-        let mut ret = vec![];
-        let mut playlists =
-            input.into_par_iter().flat_map(|ps| ps.entries.par_iter()).collect::<Vec<&YoutubePlaylist>>();
-        playlists.par_sort_by_key(|t: &&YoutubePlaylist| &*t.id);
-        let dupe_playlists = find_dupes_impl(
-            playlists.iter().copied(),
-            |t: &&YoutubePlaylist| &*t.id,
-            |t| t.entries.iter().flatten().count(),
-            |t| !t.dupe.load()
-        )?;
-        for pl in dupe_playlists {
-            pl.dupe.store(true);
-            ret.push(pl.sp_id.clone());
-        }
-
-        let mut items = playlists
-            .into_par_iter()
-            .flat_map(|p: &YoutubePlaylist| p.entries.par_iter().flatten())
-            .collect::<Vec<&TargetItem>>();
-        items.par_sort_by_key(|t: &&TargetItem| t.id);
-        let dupe_items = find_dupes_impl(
-            items,
-            |t: &&TargetItem| t.id,
-            |t| (t.progress.load(), Some(&t.uploader.uploader) == t.irrelevant.playlist_uploader.as_ref(), t.chosen_format.read().tbr.round() as u32),
-            |t| !t.dupe.load())?;
-        for item in dupe_items {
-            item.dupe.store(true);
-            ret.push(item.sp_id.clone());
-        }
-        Ok(ret.into_iter().collect())
-    }
-}
-
-fn find_dupes_impl<T: std::fmt::Debug, K: Ord + std::fmt::Debug, L: Ord + std::fmt::Debug>(
-    input: impl IntoIterator<Item = T>, key: impl Fn(&T) -> K, fitness_key: impl Fn(&T) -> L + Copy, validity_key: impl Fn(&T) -> bool + Copy,
-) -> Result<Vec<T>> {
-    let mut dupe_buckets: Vec<(K, Vec<T>)> = input
-        .into_iter()
-        .group_by(key)
-        .into_iter()
-        .filter_map(|(k, g)| Some((k, g.filter(validity_key).collect_vec())).filter(|(_k, g)| g.len() > 1))
-        .collect();
-    let mut ret = vec![];
-    for (_k, bucket) in &mut dupe_buckets {
-        bucket.sort_by_key(fitness_key);
-        ret.extend(bucket.drain(..bucket.len()-1));
-    }
-    Ok(ret)
 }

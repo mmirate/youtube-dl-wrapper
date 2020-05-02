@@ -2,27 +2,37 @@
 #![deny(clippy::todo)]
 #[allow(unused_imports)]
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use duct::cmd;
 use extension_trait::extension_trait;
 #[allow(unused_imports)]
-use log::{debug, info, warn, error, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use rayon::prelude::*;
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
+use std::time::Duration;
 use structopt::StructOpt;
 
 mod aria2;
 pub mod ytdl;
-use ytdl::PathExt;
 
 #[extension_trait]
-impl<T, U> OptionExt<T, U> for Option<T> {
+impl<T, U> OptionExtPair<T, U> for Option<T> {
     fn zip(self, optb: Option<U>) -> Option<(T, U)> {
         Some((self?, optb?))
     }
     fn rzip(self, optb: Option<U>) -> Option<(U, T)> {
         Some((optb?, self?))
+    }
+}
+#[extension_trait]
+impl<T, E> ResultExt<T, E> for std::result::Result<T, E> {
+    fn ok_but(self, f: impl FnOnce(E) -> ()) -> Option<T> {
+        match self {
+            Ok(x) => Some(x),
+            Err(x) => {
+                f(x);
+                None
+            }
+        }
     }
 }
 
@@ -37,208 +47,307 @@ impl<T> TryRecvErrorOptionExt<T> for Result<T, crossbeam_channel::TryRecvError> 
     }
 }
 
+#[extension_trait]
+impl<T> RecvTimeoutErrorOptionExt<T> for Result<T, crossbeam_channel::RecvTimeoutError> {
+    fn timeout_ok(self) -> Result<Option<T>, ()> {
+        match self {
+            Ok(x) => Ok(Some(x)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(()),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
+        }
+    }
+}
+
+#[extension_trait]
+impl<T> SendTimeoutErrorOptionExt<T> for Result<(), crossbeam_channel::SendTimeoutError<T>> {
+    fn timeout_ok(self) -> Result<(), ()> {
+        match self {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => Err(()),
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => Ok(()),
+        }
+    }
+}
+
+macro_rules! try_get {
+    ($map:ident, $key:expr) => {
+        $map.get(&$key).with_context(|| anyhow!("lost track of {:?}", $key))
+    };
+    (mut $map:ident, $key:expr) => {
+        $map.get_mut(&$key).with_context(|| anyhow!("lost track of {:?}", $key))
+    };
+}
+
+macro_rules! try_remove {
+    ($map:ident, $key:expr) => {
+        $map.remove(&$key).with_context(|| anyhow!("lost track of {:?}", $key))
+    };
+}
+macro_rules! borrow {
+    ($x:ident) => {
+        let $x = &$x;
+    };
+    (mut $x:ident) => {
+        let $x = &mut $x;
+    };
+}
+macro_rules! clone {
+    ($x:ident) => {
+        let $x = $x.clone();
+    };
+    (mut $x:ident) => {
+        let mut $x = $x.clone();
+    };
+}
+macro_rules! moove {
+    ($x:ident) => {
+        let $x = $x;
+    };
+    (mut $x:ident) => {
+        let mut $x = $x;
+    };
+}
+macro_rules! try_ok {
+    ($x:expr) => {
+        match $x {
+            Ok(x) => x,
+            Err(_) => return Ok(()),
+        }
+    };
+}
+
 #[allow(clippy::block_in_if_condition_stmt)]
-fn download_things<'a, 'b>(things: &'a BTreeMap<ytdl::StartingPoint, ytdl::YoutubePlaylists>, use_cookies: bool, interface: Option<&'b str>) -> Result<()> {
+fn download_things<'b>(
+    urls: Vec<ytdl::StartingPoint>, use_cookies: bool, interface: Option<&'b str>, postprocess: bool,
+    limit: Option<usize>,
+) -> Result<()> {
+    static STOP_REQUESTED: crossbeam_utils::atomic::AtomicCell<bool> = crossbeam_utils::atomic::AtomicCell::new(false);
+    ctrlc::set_handler(|| {
+        STOP_REQUESTED.store(true);
+    })?;
     aria2::start(use_cookies, interface)?;
 
-    let rewrites = ytdl::YoutubePlaylists::find_dupes(things.par_iter().map(|(_k, v)| v))?;
-    things.par_iter().try_for_each(|(sp, pls)| -> Result<()> {
-        if rewrites.contains(sp.id) {
-            sp.amend(pls)?;
-        }
-        Ok(())
-    })?;
+    let item_index: dashmap::DashMap<ytdl::ItemId, ytdl::TargetItem> = dashmap::DashMap::new();
 
-    info!("dupechecks complete");
-
-    macro_rules! borrow {
-        ($x:ident) => {
-            let $x = &$x;
-        };
-    }
-    macro_rules! clone {
-        ($x:ident) => {
-            let $x = $x.clone();
-        };
-    }
-    macro_rules! try_ok {
-        ($x:expr) => {
-            match $x {
-                Ok(x) => x,
-                Err(_) => return Ok(()),
-            }
-        };
-    }
-
-    let index: BTreeMap<ytdl::ItemId, (&ytdl::StartingPoint, &ytdl::TargetItem)> = things
-        .par_iter()
-        .flat_map(move |(sp, pls)| {
-            pls.entries
-                .par_iter()
-                .filter(|pl| !pl.dupe.load())
-                .flat_map(move |pl| pl.entries.par_iter().flatten())
-                .filter(|t| !t.dupe.load())
-                .map(move |t| (t.id, (sp, t)))
-        })
-        .collect();
-
-    let ready_for_enqueue: std::collections::VecDeque<(&ytdl::StartingPoint, &ytdl::TargetItem)> = index
-        .par_iter()
-        .map(|(_k, (sp, t))| -> Result<Option<(&ytdl::StartingPoint, &ytdl::TargetItem)>> {
-            Ok(match t.read_progress()? {
-                ytdl::Progress::Unknown | ytdl::Progress::Queued => Some((sp, t)),
-                ytdl::Progress::Interrupted => {
-                    match t.queue_download(&reqwest::blocking::Client::new(), use_cookies)? {
-                        ytdl::AlreadyDownloaded => {
-                            t.postprocess()?;
-                            None
-                        }
-                        ytdl::Queued => None,
-                        ytdl::QueuedButMustAmend => {
-                            sp.amend(
-                                things
-                                    .get(sp)
-                                    .with_context(|| anyhow!("lost track of parsed channel for {:?}", &sp.url))?,
-                            )?;
-                            None
-                        }
-                    }
-                }
-                ytdl::Progress::Downloaded => {
-                    t.postprocess()?;
-                    None
-                }
-                ytdl::Progress::Postprocessed => None,
-            })
-        })
-        .map(Result::transpose)
-        .flatten()
-        .collect::<Result<_>>()?;
-
-    info!("data-shuffling complete");
-
-    let poll_tick = crossbeam_channel::tick(std::time::Duration::from_secs(5));
-    let enqueue_tick = crossbeam_channel::tick(std::time::Duration::from_secs(1));
+    let postprocess_stop_requested = crossbeam_utils::atomic::AtomicCell::new(false);
+    let poll_tick = crossbeam_channel::tick(Duration::from_secs(5));
+    let enqueue_tick = crossbeam_channel::tick(Duration::from_millis(500));
     let (enqueue_complete_tx, enqueue_complete_rx) = crossbeam_channel::bounded::<()>(0);
     let (poll_waiting_tx, poll_waiting_rx) = crossbeam_channel::bounded::<_>(1);
     let (poll_stopped_tx, poll_stopped_rx) = crossbeam_channel::bounded::<_>(1);
-    let (pollstats1_tx, pollstats1_rx) = crossbeam_channel::bounded::<_>(1);
-    let (pollstats2_tx, pollstats2_rx) = crossbeam_channel::bounded::<_>(1);
-    //let (rfeq_tx, rfeq_rx) = crossbeam_channel::unbounded::<_>();
-    let (postprocess_tx, postprocess_rx) = crossbeam_channel::unbounded::<&ytdl::TargetItem>();
-    let (amend_tx, amend_rx) = crossbeam_channel::unbounded::<&ytdl::StartingPoint>();
+    let (pollstats_tx, pollstats_rx) = crossbeam_channel::bounded::<_>(1);
+
+    let (enqueue_tx, enqueue_rx) = crossbeam_channel::bounded::<ytdl::ItemId>(300);
+    let (postprocess_tx, postprocess_rx) = crossbeam_channel::unbounded::<ytdl::ItemId>();
+    let (amend_tx, amend_rx) = crossbeam_channel::unbounded::<ytdl::ItemId>();
 
     crossbeam_utils::thread::scope(|scope| {
         let mut rret: Vec<crossbeam_utils::thread::ScopedJoinHandle<Result<()>>> = vec![];
-        rret.push(scope.spawn({clone!(postprocess_tx); move |_scope| {
-            let mut enqueueing_complete = false;
-            for _ in poll_tick {
-                let (w, a, s) = ytdl::TargetItem::poll_all_downloads()?;
-                let t = (w.len(), a.len(), s.len());
-                try_ok!(|| -> Result<()> {
-                    pollstats1_tx.send_timeout(t, std::time::Duration::from_secs(1))?;
-                    pollstats2_tx.send_timeout(t, std::time::Duration::from_secs(1))?;
-                    poll_waiting_tx.send(w)?;
-                    poll_stopped_tx.send(s)?;
-                    Ok(())
-                }());
-                if !enqueueing_complete { if enqueue_complete_rx.try_recv().empty_ok().is_err() {
-                    enqueueing_complete = true;
-                } } else if t.0 + t.1 + t.2 + postprocess_tx.len() == 0 {
-                    return Ok(());
-                }
-            }
-            Ok(())
-        }}));
-        for _ in 0..2 {
-            clone!(postprocess_rx);
-            rret.push(scope.spawn(move |_scope| -> Result<()> {
-                for item in postprocess_rx {
-                    item.postprocess()?
+
+        rret.push(scope.builder().name("url items collector".to_owned()).spawn({
+            borrow!(item_index);
+            moove!(enqueue_tx);
+            move |_scope| {
+                let mut spcount = limit.unwrap_or(std::usize::MAX);
+                for mut sp in urls {
+                    if STOP_REQUESTED.load() || spcount == 0 {
+                        return Ok(());
+                    }
+                    let items: Vec<ytdl::TargetItem> = sp
+                        .read(false, use_cookies, postprocess)
+                        .ok_but(|e| warn!("Failed to read {:?}, abandoning: {:?}", sp.id, e))
+                        .unwrap_or_default();
+                    let itemcount = crossbeam_utils::atomic::AtomicCell::<usize>::new(0);
+                    try_ok!(items.into_par_iter().try_for_each(|item| -> Result<(), ()> {
+                        if let dashmap::mapref::entry::Entry::Vacant(ve) = item_index.entry(item.id) {
+                            let r = ve.insert(item).downgrade();
+                            enqueue_tx.send(*r.key()).map_err(drop)?;
+                            itemcount.fetch_add(1);
+                        }
+                        Ok(())
+                    }));
+                    if itemcount.load() > 0 {
+                        spcount -= 1;
+                    }
+                    info!("rfe'd {} items from {}", itemcount.load(), sp.id);
                 }
                 Ok(())
-            }));
+            }
+        })?);
+
+        rret.push(scope.builder().name("aria2 poller".to_owned()).spawn({
+            moove!(pollstats_tx);
+            moove!(poll_waiting_tx);
+            moove!(poll_stopped_tx);
+            move |_scope| {
+                let mut enqueueing_complete = false;
+                for _ in poll_tick {
+                    let (w, a, s) = ytdl::TargetItem::poll_all_downloads()?;
+                    let t = (w.len(), a.len(), s.len());
+                    try_ok!(pollstats_tx.send_timeout(t, Duration::from_secs(1)).timeout_ok());
+                    try_ok!(pollstats_tx.send_timeout(t, Duration::from_secs(1)).timeout_ok());
+                    try_ok!(poll_waiting_tx.send(w));
+                    try_ok!(poll_stopped_tx.send(s));
+                    enqueueing_complete = enqueueing_complete
+                        || enqueue_complete_rx.try_recv() == Err(crossbeam_channel::TryRecvError::Disconnected);
+                    if enqueueing_complete && (t.0 | t.1 | t.2) == 0 {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+        })?);
+
+        for i in 0..4 {
+            borrow!(item_index);
+            borrow!(postprocess_stop_requested);
+            clone!(postprocess_rx);
+            rret.push(scope.builder().name(format!("postprocessor #{}", i + 1)).spawn(
+                move |_scope| -> Result<()> {
+                    if postprocess {
+                        for itemid in postprocess_rx {
+                            if postprocess_stop_requested.load() {
+                                return Ok(());
+                            }
+                            if let Some((_itemid, item)) = try_remove!(item_index, itemid).ok_but(|e| error!("{:?}", e))
+                            {
+                                item.postprocess().map_err(|e| {
+                                    postprocess_stop_requested.store(true);
+                                    e
+                                })?;
+                            }
+                        }
+                    } else {
+                        for itemid in postprocess_rx {
+                            if postprocess_stop_requested.load() {
+                                return Ok(());
+                            }
+                            if let Some((_itemid, item)) = try_remove!(item_index, itemid).ok_but(|e| error!("{:?}", e))
+                            {
+                                item.dump_metadata().map_err(|e| {
+                                    postprocess_stop_requested.store(true);
+                                    e
+                                })?;
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?);
         }
         drop(postprocess_rx);
-        rret.push(scope.spawn({
-            borrow!(things);
+
+        rret.push(scope.builder().name("item modifications writebacker".to_owned()).spawn({
+            borrow!(item_index);
+            moove!(amend_rx);
             move |_scope| {
-                for sp in amend_rx {
-                    sp.amend(
-                        things.get(sp).with_context(|| anyhow!("lost track of parsed channel for {:?}", &sp.url))?,
-                    )?;
+                for itemid in amend_rx {
+                    if let Some(item) = try_get!(item_index, itemid).ok_but(|e| error!("{:?}", e)) {
+                        item.write()?;
+                    }
                 }
                 Ok(())
             }
-        }));
-        rret.push(scope.spawn({
+        })?);
+
+        rret.push(scope.builder().name("item download enqueuer".to_owned()).spawn({
+            borrow!(item_index);
             clone!(amend_tx);
             clone!(postprocess_tx);
+            clone!(pollstats_rx);
+            moove!(enqueue_rx);
             move |_scope| {
                 let _enqueue_complete_tx = enqueue_complete_tx;
                 let client = reqwest::blocking::Client::new();
-                let mut ready_for_enqueue = ready_for_enqueue;
-                let mut stats = try_ok!(pollstats1_rx.recv());
-                while let Some((sp, item)) = ready_for_enqueue.pop_front() {
-                    let _ = enqueue_tick.recv();
-                    if let Some(newstats) = try_ok!(pollstats1_rx.try_recv().empty_ok()) { stats = newstats; }
-                    while stats.0 + stats.1 >= 8 {
-                        stats = try_ok!(pollstats1_rx.recv());
+                let mut stats = try_ok!(pollstats_rx.recv());
+                for itemid in enqueue_rx {
+                    let _ = try_ok!(enqueue_tick.recv());
+                    if let Some(newstats) = try_ok!(pollstats_rx.try_recv().empty_ok()) {
+                        stats = newstats;
                     }
-                    match item.queue_download(&client, use_cookies) {
-                        Err(e) => {
-                            warn!("failed to enqueue {}, backing off: {}", item.id.to_string(), e);
-                            ready_for_enqueue.push_back((sp, item));
+                    while stats.0 + stats.1 >= 8 {
+                        stats = try_ok!(pollstats_rx.recv());
+                    }
+                    match try_get!(item_index, itemid).map(|item| item.queue_download(&client, use_cookies)) {
+                        Ok(Err(e)) => {
+                            warn!("failed to enqueue {}, abandoning it: {:?}", itemid.to_string(), e);
+                            //try_ok!(enqueue_tx.send(itemid));
                             for _ in 0..5 {
                                 try_ok!(enqueue_tick.recv());
                             }
                         }
-                        Ok(ytdl::AlreadyDownloaded) => try_ok!(postprocess_tx.send(item)),
-                        Ok(ytdl::Queued) => stats.0 += 1,
-                        Ok(ytdl::QueuedButMustAmend) => { stats.0 += 1; try_ok!(amend_tx.send(sp)) },
+                        Err(e) => error!("{:?}", e),
+                        Ok(Ok(ytdl::AlreadyDownloaded)) => try_ok!(postprocess_tx.send(itemid)),
+                        Ok(Ok(ytdl::Queued)) => stats.0 += 1,
+                        Ok(Ok(ytdl::QueuedButMustAmend)) => {
+                            stats.0 += 1;
+                            try_ok!(amend_tx.send(itemid))
+                        }
                     }
                 }
                 Ok(())
             }
-        }));
-        rret.push(scope.spawn({
-            borrow!(index);
+        })?);
+
+        rret.push(scope.builder().name("aria2 pending download refreshener".to_owned()).spawn({
+            borrow!(item_index);
+            moove!(pollstats_rx);
+            moove!(poll_waiting_rx);
             move |_scope| {
-                for (waiting, (_nw, na, _ns)) in poll_waiting_rx.into_iter().zip(pollstats2_rx) {
+                for (waiting, (_nw, na, _ns)) in poll_waiting_rx.into_iter().zip(pollstats_rx) {
                     waiting.into_iter().take(na * 4).try_for_each(|dl: aria2::Download| -> Result<()> {
-                        let &(sp, item) =
-                            index.get(&dl.gid.into()).with_context(|| format!("lost track of {:?}", dl.gid))?;
-                        if item.requeue_if_needed(use_cookies)? {
-                            try_ok!(amend_tx.send(sp));
+                        if let Some(item) =
+                            try_get!(item_index, ytdl::ItemId::from(dl.gid)).ok_but(|e| error!("{:?}", e))
+                        {
+                            if item.requeue_if_needed(use_cookies)? {
+                                try_ok!(amend_tx.send(dl.gid.into()));
+                            }
                         }
                         Ok(())
                     })?;
                 }
                 Ok(())
             }
-        }));
-        rret.push(scope.spawn({
-            borrow!(index);
+        })?);
+
+        rret.push(scope.builder().name("aria2 finished download reactor".to_owned()).spawn({
+            borrow!(item_index);
+            moove!(poll_stopped_rx);
+            moove!(poll_stopped_rx);
+            moove!(postprocess_tx);
             move |_scope| {
                 let client = reqwest::blocking::Client::new();
                 for stopped in poll_stopped_rx {
                     for dl in stopped {
-                        let &(_sp, item) =
-                            index.get(&dl.gid.into()).with_context(|| format!("lost track of {:?}", dl.gid))?;
                         match &dl.status {
                             aria2::DownloadStatus::Complete => {
-                                item.write_progress(ytdl::Progress::Downloaded)?;
-                                try_ok!(postprocess_tx.send(item));
-                                aria2::RemoveResultParams::new(dl.gid).send_with(&client)?;
+                                if let Some(item) = try_get!(item_index, ytdl::ItemId::from(dl.gid))
+                                    .ok_but(|e| error!("download succeeded but item lost: {:?}", e))
+                                {
+                                    item.write_progress(ytdl::Progress::Downloaded)?;
+                                    aria2::RemoveResultParams::new(dl.gid).send_with(&client)?;
+                                    try_ok!(postprocess_tx.send(dl.gid.into()));
+                                }
                             }
-                            aria2::DownloadStatus::Error => bail!(
-                                "download of {} failed, code {:?}: {:?}",
-                                item.id.to_string(),
-                                dl.error_code,
-                                dl.error_message
-                            ),
+                            aria2::DownloadStatus::Error => {
+                                error!(
+                                    "download of {} failed, code {:?}: {:?}",
+                                    ytdl::ItemId::from(dl.gid).to_string(),
+                                    dl.error_code,
+                                    dl.error_message
+                                );
+                                if let Some(item) =
+                                    try_get!(item_index, ytdl::ItemId::from(dl.gid)).ok_but(|e| error!("{:?}", e))
+                                {
+                                    item.write_progress(ytdl::Progress::Interrupted)?;
+                                }
+                                aria2::RemoveResultParams::new(dl.gid).send()?;
+                            }
                             aria2::DownloadStatus::Removed => {
-                                warn!("someone pulled {} out from under us; continuing", item.id.to_string());
+                                warn!(
+                                    "someone pulled {} out from under us; continuing",
+                                    ytdl::ItemId::from(dl.gid).to_string()
+                                );
                                 aria2::RemoveResultParams::new(dl.gid).send_with(&client)?;
                             }
                             aria2::DownloadStatus::Waiting
@@ -246,7 +355,7 @@ fn download_things<'a, 'b>(things: &'a BTreeMap<ytdl::StartingPoint, ytdl::Youtu
                             | aria2::DownloadStatus::Active => error!(
                                 "tellStopped gave us item {:?}/{} which was actually {:?}",
                                 dl.gid,
-                                item.id.to_string(),
+                                ytdl::ItemId::from(dl.gid).to_string(),
                                 dl.status
                             ),
                         }
@@ -254,20 +363,22 @@ fn download_things<'a, 'b>(things: &'a BTreeMap<ytdl::StartingPoint, ytdl::Youtu
                 }
                 Ok(())
             }
-        }));
+        })?);
+
         // every sender should be U.o.M.V. here:
-        // drop(poll_waiting_tx); drop(poll_stopped_tx); drop(pollstats1_tx); drop(pollstats2_tx); drop(postprocess_tx); drop(amend_tx);
+        /*
+        drop(enqueue_complete_tx);
+        drop(enqueue_tx); drop(postprocess_tx); drop(amend_tx);
+        drop(poll_waiting_tx); drop(poll_stopped_tx); drop(pollstats_tx); */
         rret.into_iter().filter_map(|h| h.join().ok()).collect::<Result<Vec<_>>>()
     })
     .unwrap()?;
 
-    // Ok(());
-    todo!(r#"TODO:
-    ctrlc
-    scrape and parse in-pipeline with everything else (all dataplumbing via channels, bounded backpressure to avoid stale scrapes, etc.)
-    rescrape entire StartingPoint if it's full of stale dl links
-    aria2c --interface=tun0
-    "#)
+    Ok(())
+    /*TODO:
+    USE THIS FUNCTION CORRECTLY
+    CHECK FOR DEAD CODE AND OTHER LOGIC PROBLEMS
+    */
 }
 
 fn read_input_files<'o, 'i1: 'o, 'i2: 'o>(
@@ -297,22 +408,16 @@ fn read_input_files<'o, 'i1: 'o, 'i2: 'o>(
 #[derive(StructOpt, Debug)]
 #[structopt()]
 struct Opt {
-    /// download data via parsed metadata
+    /// enable postprocessing
     #[structopt(short, long)]
-    download: bool,
-    /// scrape metadata (else, only read from disk cache)
-    #[structopt(short, long)]
-    scrape: bool,
-    /// deserialize scraped metadata
-    #[structopt(short, long, required_if("download", "true"))]
-    parse: bool,
+    postprocess: bool,
     /// only use the first LIMIT metadata URLs
     #[structopt(short, long)]
     limit: Option<usize>,
     /// use cookiejar
     #[structopt(short, long)]
     cookies: bool,
-    /// change to directory DIR
+    /// bind to specific interface for downloads
     #[structopt(short, long)]
     interface: Option<String>,
     /// change to directory DIR
@@ -339,61 +444,7 @@ pub fn main() -> Result<()> {
     let mut file_contents_buffer = String::new();
     let urls =
         read_input_files(&opt.files, &mut file_contents_buffer)?.collect::<Result<Vec<ytdl::StartingPoint>>>()?;
-    let (pending_changes_tx, pending_changes_rx) = crossbeam_channel::unbounded::<String>();
-    let sedscript_path = std::env::current_dir()?.join("pending_changes.sed");
-    let mut pending_changes =
-        std::fs::OpenOptions::new().read(false).write(true).create_new(true).open(&sedscript_path).or_else(
-            |e| -> Result<_> {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    let mut sed_args: Vec<Result<&str>> =
-                        vec![Ok("-i.bak"), Ok("-f"), sedscript_path.as_path().try_to_str(), Ok("--")];
-                    sed_args.extend(opt.files.iter().map(PathBuf::as_path).map(ytdl::PathExt::try_to_str));
-                    let cmd = cmd("sed", sed_args.into_iter().collect::<Result<Vec<_>>>()?);
-                    warn!("sed script already exists, running it inplace via {:?} then deleting it", cmd);
-                    cmd.run()?;
-                    std::fs::OpenOptions::new()
-                        .read(false)
-                        .write(true)
-                        .truncate(true)
-                        .open(&sedscript_path)
-                        .map_err(From::from)
-                } else {
-                    Err(e).map_err(From::from)
-                }
-            },
-        )?;
-    rayon::spawn(move || {
-        let mut wrote = false;
-        for s in pending_changes_rx {
-            wrote = true;
-            pending_changes.write_all(&s.as_ref()).unwrap();
-            pending_changes.flush().unwrap();
-        }
-        if !wrote {
-            std::fs::remove_file(sedscript_path).unwrap();
-        }
-    });
-
-    let limit = opt.limit.unwrap_or_default().wrapping_sub(1).saturating_add(1);
-    let count = crossbeam_utils::atomic::AtomicCell::new(0usize);
-    let things = urls
-        .into_par_iter()
-        .map(|mut sp: ytdl::StartingPoint| -> Result<Option<_>> {
-            info!("read {:?}", sp);
-            if opt.scrape {
-                sp.scrape(pending_changes_tx.clone(), opt.cookies)?;
-            }
-            Ok(if opt.parse { sp.read()?.rzip(Some(sp)) } else { None })
-        })
-        .flat_map(Result::transpose)
-        .filter(|r| if r.is_ok() { count.fetch_add(1) < limit } else { true })
-        .collect::<Result<_>>()?;
-    drop(pending_changes_tx);
-    if opt.download {
-        download_things(&things, opt.cookies, opt.interface.as_deref())?;
-    } else {
-        info!("Parsed {} items", things.len());
-    }
+    download_things(urls, opt.cookies, opt.interface.as_deref(), opt.postprocess, opt.limit)?;
 
     Ok(())
 }

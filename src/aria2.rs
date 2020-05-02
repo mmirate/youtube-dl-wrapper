@@ -21,6 +21,7 @@ pub fn start(use_cookies: bool, interface: Option<&str>) -> Result<()> {
     let temp3;
     let mut aria2_args = vec![
         // "--show-console-readout=false", // "--quiet",
+        "--disable-ipv6",
         "--force-save=true",
         "--save-session=aria2-session.txt",
         "--always-resume=false",
@@ -282,6 +283,7 @@ pub(crate) struct TellStatusParams {
     params: (&'static str, Gid, &'static [&'static str]),
 }
 impl TellStatusParams {
+    #[allow(dead_code)]
     pub(crate) fn new(gid: Gid) -> JsonRpcEnvelope<Self> {
         JsonRpcEnvelope::new(TellStatusParams {
             method: "aria2.tellStatus",
