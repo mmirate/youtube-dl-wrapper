@@ -6,17 +6,20 @@ edition = "2018"
 
 [dependencies]
 anyhow = "^1"
-base64 = "^0.11"
+base64 = "<2"
 base64-serde = "^0.5"
 chrono = { version = "^0.4", features = ["serde"] }
 crossbeam-channel = "^0.4"
 crossbeam-queue = "^0.2"
 crossbeam-utils = "^0.7"
 ctrlc = { version = "^3", features = ["termination"] }
+dashmap = "3.11.1"
 derivative = "^2"
 duct = "^0.13"
 env_logger = "^0.7"
 extension-trait = "^0.2"
+fs3 = "0.5"
+glob = "0.3"
 hex = { version = "^0.4", features = ["serde"] }
 itertools = "^0.9"
 kuchiki = "^0.8"
@@ -32,9 +35,6 @@ reqwest = { version = "^0.10", default-features = false, features = ["json", "bl
 serde = { version = "^1", features = ["derive", "rc"] }
 serde_json = "1"
 structopt = "^0.3"
-# fixed = { version = "0.5.5", features = ["serde", "std"] }
-dashmap = "3.11.1"
-fs3 = "0.5.0"
 
 [profile.release]
 # panic = "abort"

@@ -14,11 +14,11 @@ static ARIA2_TOKEN: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|
 static ARIA2_URL: &str = "http://localhost:6800/jsonrpc";
 static RPC_CLIENT: once_cell::sync::Lazy<reqwest::blocking::Client> = once_cell::sync::Lazy::new(Default::default);
 
-pub fn start(use_cookies: bool, interface: Option<&str>) -> Result<()> {
+pub fn start(use_cookies: bool) -> Result<()> {
     let aria2_exe = "aria2c";
     let temp1 = format!("--rpc-secret={}", ARIA2_TOKEN.splitn(2, ':').last().unwrap());
     let temp2 = format!("--stop-with-process={}", std::process::id());
-    let temp3;
+    //let temp3;
     let mut aria2_args = vec![
         // "--show-console-readout=false", // "--quiet",
         "--disable-ipv6",
@@ -38,10 +38,10 @@ pub fn start(use_cookies: bool, interface: Option<&str>) -> Result<()> {
     if use_cookies {
         aria2_args.push("--load-cookies=cookies.txt");
     }
-    if let Some(interface) = interface {
+    /*if let Some(interface) = interface {
         temp3 = format!("--interface={}", interface);
         aria2_args.push(&*temp3);
-    }
+    }*/
     info!("starting aria2");
 
     if cfg!(windows) {

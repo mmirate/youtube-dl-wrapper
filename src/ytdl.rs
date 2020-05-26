@@ -266,6 +266,17 @@ fn youtube_dl(url: &str, use_cookies: bool) -> Result<duct::ReaderHandle> {
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ItemId(pub u64);
+impl std::str::FromStr for ItemId {
+    type Err = anyhow::Error;
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let mut output: [u8; 8] = Default::default();
+        if input.len() != 11 {
+            bail!("id must be 11 chars of base64");
+        }
+        base64::decode_config_slice(input, URL_SAFE_NO_PAD, &mut output)?;
+        Ok(ItemId(u64::from_ne_bytes(output)))
+    }
+}
 impl ToString for ItemId {
     fn to_string(&self) -> String {
         let input: [u8; 8] = self.0.to_ne_bytes();
@@ -352,10 +363,11 @@ pub(crate) enum Progress {
     Interrupted,
     Queued,
     Downloaded,
-    Postprocessed,
+    Remuxed,
+    Recoded,
 }
 impl Progress {
-    pub(crate) const MAX: Progress = Progress::Postprocessed;
+    pub(crate) const MAX: Progress = Progress::Recoded;
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -522,6 +534,7 @@ impl TargetItem {
         let path = self.info_filename();
         serde_json::from_reader(std::fs::File::open(path)?).map_err(From::from)
     }
+    pub(crate) fn progress(&self) -> Progress { self.progress.load() }
     pub(crate) fn write(&self) -> Result<()> {
         let path = self.info_filename();
         let new_contents = serde_json::to_string_pretty(&self)?;
@@ -679,11 +692,8 @@ impl TargetItem {
     pub(crate) fn dump_metadata(&self) -> Result<()> {
         {
             let progress = self.progress.load();
-            if progress >= Progress::Postprocessed && self.filename_with_extension("flac").is_file() {
-                self.write_progress(Progress::Downloaded)?;
-            // nah, don't remove the flac yet
-            } else if progress < Progress::Downloaded {
-                warn!("tried to postprocess {} before it was downloaded, ignoring", self.id.to_string());
+            if progress < Progress::Downloaded {
+                warn!("tried to dump metadata for {} before it was downloaded, ignoring", self.id.to_string());
                 return Ok(());
             }
         }
@@ -769,19 +779,19 @@ impl TargetItem {
         cmd("ffmpeg", ffmpeg_args).run()?;
         Ok(())
     }
-    pub(crate) fn postprocess(&self) -> Result<()> {
+    fn remux(&self) -> Result<()> {
         {
             let progress = self.progress.load();
             if progress < Progress::Downloaded {
-                warn!("tried to postprocess {} before it was downloaded, ignoring", self.id.to_string());
+                warn!("tried to remux {} before it was downloaded, ignoring", self.id.to_string());
                 return Ok(());
-            } else if progress >= Progress::Postprocessed {
-                warn!("tried to postprocess {} in duplicate, ignoring", self.id.to_string());
+            } else if progress >= Progress::Remuxed {
+                warn!("tried to remux {} in duplicate, ignoring", self.id.to_string());
                 return Ok(());
             }
         }
         self.dump_metadata()?;
-        info!("postprocessing {}", self.id.to_string());
+        info!("remuxing {}", self.id.to_string());
         let output_directory = Path::new("remuxed");
         match std::fs::create_dir(output_directory) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -793,18 +803,9 @@ impl TargetItem {
             static RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
                 regex::Regex::new(r#"(?m)^codec_name=(.+)$(?:.|\n)+?^codec_type=audio$"#).unwrap()
             });
-            let buf = cmd(
-                "ffprobe",
-                &[
-                    "-loglevel",
-                    "level+warning",
-                    "-hide_banner",
-                    "-show_streams",
-                    &input_filename,
-                ],
-            )
-            .stdout_capture()
-            .read()?;
+            let buf = cmd("ffprobe", &["-loglevel", "level+warning", "-hide_banner", "-show_streams", &input_filename])
+                .stdout_capture()
+                .read()?;
             RE.captures(&buf)
                 .map(|cs| cs[1].to_owned())
                 .with_context(|| format!("Cannot probe codec for {:?}", &self.id.to_string()))?
@@ -844,7 +845,142 @@ impl TargetItem {
         ];
 
         cmd("ffmpeg", ffmpeg_args).run()?;
-        self.write_progress(Progress::Postprocessed)?;
+        self.write_progress(Progress::Remuxed)?;
+        Ok(())
+    }
+    fn recode(&self) -> Result<()> {
+        {
+            let progress = self.progress.load();
+            if progress < Progress::Remuxed {
+                warn!("tried to recode {} before it was remuxed, ignoring", self.id.to_string());
+                return Ok(());
+            } else if progress >= Progress::Recoded {
+                warn!("tried to recode {} in duplicate, ignoring", self.id.to_string());
+                return Ok(());
+            }
+        }
+        info!("recoding {}", self.id.to_string());
+        let input_filename: PathBuf =
+            glob::glob(Path::new("remuxed").join(format!("{}.*", self.id.to_string())).as_path().try_to_str()?)?
+                .filter_map(Result::ok)
+                .next()
+                .with_context(|| format!("remux lost for {}", self.id.to_string()))?;
+        let output_filename: PathBuf = {
+            let tmp: String = self.id.to_string();
+            let (head, tail) = tmp.split_at(tmp.len() - 8);
+            Path::new("recoded").join(head).join(format!("{}.mp3", tail))
+        };
+        if input_filename == output_filename {
+            return Ok(());
+        }
+
+        /*
+        let ffmpeg_args_stats = &[
+            "-y",
+            "-nostats",
+            "-nostdin",
+            "-hide_banner",
+            "-i",
+            input_filename.as_path().try_to_str()?,
+            "-af",
+            "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=print_format=json,dual_mono=true",
+            "-f",
+            "null",
+            "/dev/null",
+        ];
+
+        static LOUDNORM_STATS_RE: once_cell::sync::Lazy<regex::Regex> =
+            once_cell::sync::Lazy::new(|| regex::Regex::new(r#"(?m)^\s*\{\s*$\p{any}+?^\s*\}\s*$"#).unwrap());
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LoudnormStatsRaw<'a> {
+            input_i: &'a str,
+            input_tp: &'a str,
+            input_lra: &'a str,
+            input_thresh: &'a str,
+            output_i: &'a str,
+            output_tp: &'a str,
+            output_lra: &'a str,
+            output_thresh: &'a str,
+            normalization_type: &'a str,
+            target_offset: &'a str,
+        }
+        struct LoudnormStatsChecked<'a> {
+            #[allow(dead_code)]
+            input_i: f64,
+            #[allow(dead_code)]
+            input_tp: f64,
+            #[allow(dead_code)]
+            input_lra: f64,
+            #[allow(dead_code)]
+            input_thresh: f64,
+            #[allow(dead_code)]
+            output_i: f64,
+            #[allow(dead_code)]
+            output_tp: f64,
+            #[allow(dead_code)]
+            output_lra: f64,
+            #[allow(dead_code)]
+            output_thresh: f64,
+            #[allow(dead_code)]
+            normalization_type: &'a str,
+            #[allow(dead_code)]
+            target_offset: f64,
+        }
+        impl<'a> LoudnormStatsRaw<'a> {
+            fn checked(self) -> Result<Self> {
+                let LoudnormStatsRaw { ref input_i, ref input_tp, ref input_lra, ref input_thresh, ref output_i, ref output_lra, ref output_tp, ref output_thresh, ref normalization_type, ref target_offset } = self;
+                let input_i = input_i.parse()?;
+                let input_tp = input_tp.parse()?;
+                let input_lra = input_lra.parse()?;
+                let input_thresh = input_thresh.parse()?;
+                let output_i = output_i.parse()?;
+                let output_lra = output_lra.parse()?;
+                let output_tp = output_tp.parse()?;
+                let output_thresh = output_thresh.parse()?;
+                let target_offset = target_offset.parse()?;
+                let _ = LoudnormStatsChecked { input_i, input_tp, input_lra, input_thresh, output_i, output_lra, output_tp, output_thresh, normalization_type, target_offset };
+                Ok(self)
+            }
+            fn into_audiofilter(self) -> String {
+                format!(
+                    "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=linear=true:measured_I={}:measured_LRA={}:measured_tp={}:measured_thresh={}:dual_mono=true",
+                    self.input_i, self.input_lra, self.input_tp, self.input_thresh
+                )
+            }
+        }*/
+
+        let ffmpeg_args = {
+            //let buf = cmd("ffmpeg", ffmpeg_args_stats).stderr_to_stdout().read()?;
+            &[
+                "-y",
+                "-nostats",
+                "-nostdin",
+                "-hide_banner",
+                "-i",
+                input_filename.as_path().try_to_str()?,
+                //"-af",
+                //"compand=attacks=.3|.3:decays=1|1:points=-90/-60|-60/-40|-40/-30|-20/-20:soft-knee=6:gain=0:volume=-90:delay=1",
+                //"-af",
+                //&*serde_json::from_str::<LoudnormStatsRaw>(LOUDNORM_STATS_RE.find(&buf).context("loudnorm stats failed")?.as_str())?.checked()?.into_audiofilter(),
+                "-af",
+                "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=i=-16:lra=8:tp=0:dual_mono=true",
+                "-ar",
+                "48000",
+                &output_filename.as_path().try_to_str()?,
+            ]
+        };
+
+        cmd("ffmpeg", ffmpeg_args).run()?;
+        self.write_progress(Progress::Recoded)?;
+        Ok(())
+    }
+    pub(crate) fn postprocess(&self) -> Result<()> {
+        if self.progress.load() < Progress::Remuxed {
+            self.remux()?;
+        }
+        self.recode()?;
         Ok(())
     }
 }
@@ -873,11 +1009,7 @@ impl YoutubePlaylist {
         self.entries.iter().flatten().map(|item| item.expiry()).flatten().max()
     }
     pub(crate) fn progress(&self) -> Option<Progress> {
-        self.entries
-            .par_iter()
-            .flatten()
-            .map(|t| t.progress.load())
-            .min()
+        self.entries.par_iter().flatten().map(|t| t.progress.load()).min()
     }
 }
 
@@ -905,11 +1037,7 @@ impl YoutubePlaylists {
         self.entries.iter().map(YoutubePlaylist::expiry).flatten().max()
     }
     pub(crate) fn progress(&self) -> Option<Progress> {
-        self.entries
-            .par_iter()
-            .map(YoutubePlaylist::progress)
-            .flatten()
-            .min()
+        self.entries.par_iter().map(YoutubePlaylist::progress).flatten().min()
     }
     fn singleton_from_playlist(playlist: YoutubePlaylist) -> Self {
         YoutubePlaylists { entries: vec![playlist], ..Default::default() }

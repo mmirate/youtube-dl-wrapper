@@ -6,6 +6,7 @@ use extension_trait::extension_trait;
 #[allow(unused_imports)]
 use log::{debug, error, info, warn, LevelFilter};
 use rayon::prelude::*;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -117,15 +118,15 @@ macro_rules! try_ok {
 }
 
 #[allow(clippy::block_in_if_condition_stmt)]
-fn download_things<'b>(
-    urls: Vec<ytdl::StartingPoint>, use_cookies: bool, interface: Option<&'b str>, postprocess: bool,
+fn download_things(
+    urls: Vec<ytdl::StartingPoint>, ignores: BTreeSet<ytdl::ItemId>, use_cookies: bool, postprocess: bool,
     limit: Option<usize>,
 ) -> Result<()> {
     static STOP_REQUESTED: crossbeam_utils::atomic::AtomicCell<bool> = crossbeam_utils::atomic::AtomicCell::new(false);
     ctrlc::set_handler(|| {
         STOP_REQUESTED.store(true);
     })?;
-    aria2::start(use_cookies, interface)?;
+    aria2::start(use_cookies)?;
 
     let item_index: dashmap::DashMap<ytdl::ItemId, ytdl::TargetItem> = dashmap::DashMap::new();
 
@@ -146,7 +147,9 @@ fn download_things<'b>(
 
         rret.push(scope.builder().name("url items collector".to_owned()).spawn({
             borrow!(item_index);
+            clone!(postprocess_tx);
             moove!(enqueue_tx);
+            moove!(ignores);
             move |_scope| {
                 let mut spcount = limit.unwrap_or(std::usize::MAX);
                 for mut sp in urls {
@@ -161,15 +164,25 @@ fn download_things<'b>(
                     try_ok!(items.into_par_iter().try_for_each(|item| -> Result<(), ()> {
                         if let dashmap::mapref::entry::Entry::Vacant(ve) = item_index.entry(item.id) {
                             let r = ve.insert(item).downgrade();
-                            enqueue_tx.send(*r.key()).map_err(drop)?;
-                            itemcount.fetch_add(1);
+                            if ignores.contains(r.key()) {
+                                info!("ignoring {}", r.key().to_string());
+                            } else if match r.value().progress() {
+                                ytdl::Progress::Unknown | ytdl::Progress::Interrupted => Some(&enqueue_tx),
+                                ytdl::Progress::Queued => Some(&enqueue_tx),
+                                ytdl::Progress::Downloaded => Some(&postprocess_tx),
+                                ytdl::Progress::Remuxed => Some(&postprocess_tx),
+                                ytdl::Progress::Recoded => None,
+                            }.map(|c| c.send(*r.key()).map_err(drop)).transpose()?.is_some() {
+                                itemcount.fetch_add(1);
+                            }
                         }
                         Ok(())
                     }));
-                    if itemcount.load() > 0 {
+                    let itemcount = itemcount.into_inner();
+                    if itemcount > 0 {
                         spcount -= 1;
                     }
-                    info!("rfe'd {} items from {}", itemcount.load(), sp.id);
+                    info!("rfe'd {} items from {}", itemcount, sp.id);
                 }
                 Ok(())
             }
@@ -202,7 +215,7 @@ fn download_things<'b>(
             borrow!(item_index);
             borrow!(postprocess_stop_requested);
             clone!(postprocess_rx);
-            rret.push(scope.builder().name(format!("postprocessor #{}", i + 1)).spawn(
+            rret.push(scope.builder().name(format!("postproc #{}", i + 1)).spawn(
                 move |_scope| -> Result<()> {
                     if postprocess {
                         for itemid in postprocess_rx {
@@ -271,7 +284,6 @@ fn download_things<'b>(
                     match try_get!(item_index, itemid).map(|item| item.queue_download(&client, use_cookies)) {
                         Ok(Err(e)) => {
                             warn!("failed to enqueue {}, abandoning it: {:?}", itemid.to_string(), e);
-                            //try_ok!(enqueue_tx.send(itemid));
                             for _ in 0..5 {
                                 try_ok!(enqueue_tick.recv());
                             }
@@ -375,15 +387,11 @@ fn download_things<'b>(
     .unwrap()?;
 
     Ok(())
-    /*TODO:
-    USE THIS FUNCTION CORRECTLY
-    CHECK FOR DEAD CODE AND OTHER LOGIC PROBLEMS
-    */
 }
 
-fn read_input_files<'o, 'i1: 'o, 'i2: 'o>(
+fn read_files<'o, 'i1: 'o, 'i2: 'o>(
     files: impl IntoIterator<Item = &'i1 PathBuf>, buffer: &'i2 mut String,
-) -> Result<impl ParallelIterator<Item = Result<ytdl::StartingPoint<'o>>>> {
+) -> Result<(Vec<std::ops::Range<usize>>, &'o str)> {
     let mut i: usize = 0;
     let mut file_offsets = vec![];
     for file in files {
@@ -392,8 +400,14 @@ fn read_input_files<'o, 'i1: 'o, 'i2: 'o>(
         i = i.checked_add(len).context("usize overflow from the url-file buffer")?;
         file_offsets.push(start..len);
     }
-    let buffer = buffer.as_str(); // ixnay the mut borrow so we can slice it like salami
-    Ok(file_offsets
+    Ok((file_offsets, buffer.as_str()))
+}
+
+fn parse_input_files<'a>(
+    tuple: (Vec<std::ops::Range<usize>>, &'a str),
+) -> impl ParallelIterator<Item = Result<ytdl::StartingPoint<'a>>> {
+    let (file_offsets, buffer) = tuple;
+    file_offsets
         .into_par_iter()
         .flat_map(move |range: std::ops::Range<usize>| {
             (&buffer[range])
@@ -402,7 +416,23 @@ fn read_input_files<'o, 'i1: 'o, 'i2: 'o>(
                 .filter_map(|s: &str| s.split_ascii_whitespace().last())
                 .filter(|s: &&str| !s.is_empty())
         })
-        .map(ytdl::StartingPoint::new))
+        .map(ytdl::StartingPoint::new)
+}
+
+fn parse_ignore_files<'a>(
+    tuple: (Vec<std::ops::Range<usize>>, &'a str),
+) -> impl ParallelIterator<Item = Result<ytdl::ItemId>> + 'a {
+    let (file_offsets, buffer) = tuple;
+    file_offsets
+        .into_par_iter()
+        .flat_map(move |range: std::ops::Range<usize>| {
+            (&buffer[range])
+                .par_lines()
+                .filter_map(|s| s.splitn(2, |c: char| "#;".contains(c)).next())
+                .filter_map(|s| s.splitn(2, '.').next())
+                .filter(|s: &&str| !s.is_empty())
+        })
+        .map(|s| str::parse(s))
 }
 
 #[derive(StructOpt, Debug)]
@@ -415,14 +445,14 @@ struct Opt {
     #[structopt(short, long)]
     limit: Option<usize>,
     /// use cookiejar
-    #[structopt(short, long)]
-    cookies: bool,
-    /// bind to specific interface for downloads
-    #[structopt(short, long)]
-    interface: Option<String>,
+    #[structopt(short = "c", long)]
+    use_cookies: bool,
     /// change to directory DIR
     #[structopt(short = "C", long, name = "DIR", parse(from_os_str))]
     directory: Option<PathBuf>,
+    /// list of IDs to ignore
+    #[structopt(short, long, name = "FILE", parse(from_os_str))]
+    ignore_file: Option<PathBuf>,
     /// lists of metadata URLs
     #[structopt(name = "FILE", required(true), parse(from_os_str))]
     files: Vec<PathBuf>,
@@ -441,10 +471,12 @@ pub fn main() -> Result<()> {
         opt
     };
 
-    let mut file_contents_buffer = String::new();
-    let urls =
-        read_input_files(&opt.files, &mut file_contents_buffer)?.collect::<Result<Vec<ytdl::StartingPoint>>>()?;
-    download_things(urls, opt.cookies, opt.interface.as_deref(), opt.postprocess, opt.limit)?;
+    let mut file_contents_buffer = Default::default();
+    let mut ignorefile_contents_buffer = Default::default();
+    let urls = parse_input_files(read_files(&opt.files, &mut file_contents_buffer)?).collect::<Result<_>>()?;
+    let ignores =
+        parse_ignore_files(read_files(&opt.ignore_file, &mut ignorefile_contents_buffer)?).collect::<Result<_>>()?;
+    download_things(urls, ignores, opt.use_cookies, opt.postprocess, opt.limit)?;
 
     Ok(())
 }
