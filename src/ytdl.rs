@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::URL_SAFE_NO_PAD;
 use chrono::prelude::*;
 use crossbeam_utils::atomic::AtomicCell;
-use derivative::*;  // star-import is to appease rust-analyzer
+use derivative::*; // star-import is to appease rust-analyzer
 use duct::cmd;
 use extension_trait::extension_trait;
 use kuchiki::traits::*;
@@ -320,6 +320,29 @@ impl Serialize for ItemId {
     }
 }
 
+struct Parsed<T>(T);
+impl<'de, T: std::str::FromStr> Deserialize<'de> for Parsed<T>
+where
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let input: String = Deserialize::deserialize(deserializer)?;
+        Ok(Parsed(input.parse().map_err(D::Error::custom)?))
+    }
+}
+impl<T: std::string::ToString> Serialize for Parsed<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
 fn deserialize_ac<'de, D, T: Deserialize<'de> + Copy>(deserializer: D) -> Result<AtomicCell<T>, D::Error>
 where
     D: serde::de::Deserializer<'de>,
@@ -534,7 +557,9 @@ impl TargetItem {
         let path = self.info_filename();
         serde_json::from_reader(std::fs::File::open(path)?).map_err(From::from)
     }
-    pub(crate) fn progress(&self) -> Progress { self.progress.load() }
+    pub(crate) fn progress(&self) -> Progress {
+        self.progress.load()
+    }
     pub(crate) fn write(&self) -> Result<()> {
         let path = self.info_filename();
         let new_contents = serde_json::to_string_pretty(&self)?;
@@ -658,12 +683,6 @@ impl TargetItem {
             }
         }
         info!("queueing {}", self.id.to_string());
-        /*match (std::fs::metadata(self.filename()), self.chosen_format.filesize) {
-            (Err(e), _) if e.kind() == std::io::ErrorKind::NotFound => {},
-            (Err(e), _) => Err(e)?,
-            (Ok(m), maybe_len) if !m.is_file() || maybe_len != Some(m.len()) => {},
-            (Ok(_), _) => return Ok(false),
-        }*/
         let (old_url, cfg) = self.refresh_if_needed(self.chosen_format.upgradable_read(), use_cookies)?;
         let headers =
             self.chosen_format.read().http_headers.iter().map(|(k, v)| format!("{}: {}", k, v)).collect::<Vec<_>>();
@@ -874,6 +893,7 @@ impl TargetItem {
             return Ok(());
         }
 
+        static SILENCE_REMOVER: &'static str = "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02";
         let ffmpeg_args_stats = &[
             "-y",
             "-nostats",
@@ -882,7 +902,7 @@ impl TargetItem {
             "-i",
             input_filename.as_path().try_to_str()?,
             "-af",
-            "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=print_format=json,dual_mono=true",
+            &*format!("{},loudnorm=print_format=json,dual_mono=true", SILENCE_REMOVER),
             "-f",
             "null",
             "/dev/null",
@@ -893,59 +913,29 @@ impl TargetItem {
 
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct LoudnormStatsRaw<'a> {
-            input_i: &'a str,
-            input_tp: &'a str,
-            input_lra: &'a str,
-            input_thresh: &'a str,
-            output_i: &'a str,
-            output_tp: &'a str,
-            output_lra: &'a str,
-            output_thresh: &'a str,
-            normalization_type: &'a str,
-            target_offset: &'a str,
-        }
-        struct LoudnormStatsChecked<'a> {
+        struct LoudnormStats<'a> {
+            input_i: Parsed<f64>,
+            input_tp: Parsed<f64>,
+            input_lra: Parsed<f64>,
+            input_thresh: Parsed<f64>,
             #[allow(dead_code)]
-            input_i: f64,
+            output_i: Parsed<f64>,
             #[allow(dead_code)]
-            input_tp: f64,
+            output_tp: Parsed<f64>,
             #[allow(dead_code)]
-            input_lra: f64,
+            output_lra: Parsed<f64>,
             #[allow(dead_code)]
-            input_thresh: f64,
-            #[allow(dead_code)]
-            output_i: f64,
-            #[allow(dead_code)]
-            output_tp: f64,
-            #[allow(dead_code)]
-            output_lra: f64,
-            #[allow(dead_code)]
-            output_thresh: f64,
+            output_thresh: Parsed<f64>,
             #[allow(dead_code)]
             normalization_type: &'a str,
             #[allow(dead_code)]
-            target_offset: f64,
+            target_offset: Parsed<f64>,
         }
-        impl<'a> LoudnormStatsRaw<'a> {
-            fn checked(self) -> Result<Self> {
-                let LoudnormStatsRaw { ref input_i, ref input_tp, ref input_lra, ref input_thresh, ref output_i, ref output_lra, ref output_tp, ref output_thresh, ref normalization_type, ref target_offset } = self;
-                let input_i = input_i.parse()?;
-                let input_tp = input_tp.parse()?;
-                let input_lra = input_lra.parse()?;
-                let input_thresh = input_thresh.parse()?;
-                let output_i = output_i.parse()?;
-                let output_lra = output_lra.parse()?;
-                let output_tp = output_tp.parse()?;
-                let output_thresh = output_thresh.parse()?;
-                let target_offset = target_offset.parse()?;
-                let _ = LoudnormStatsChecked { input_i, input_tp, input_lra, input_thresh, output_i, output_lra, output_tp, output_thresh, normalization_type, target_offset };
-                Ok(self)
-            }
+        impl<'a> LoudnormStats<'a> {
             fn into_audiofilter(self) -> String {
                 format!(
-                    "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=linear=true:measured_I={}:measured_LRA={}:measured_tp={}:measured_thresh={}:dual_mono=true",
-                    self.input_i, self.input_lra, self.input_tp, self.input_thresh
+                    "{},loudnorm=linear=true:measured_I={}:measured_LRA={}:measured_tp={}:measured_thresh={}:dual_mono=true",
+                    SILENCE_REMOVER, self.input_i.0, self.input_lra.0, self.input_tp.0, self.input_thresh.0
                 )
             }
         }
@@ -962,7 +952,10 @@ impl TargetItem {
                 //"-af",
                 //"compand=attacks=.3|.3:decays=1|1:points=-90/-60|-60/-40|-40/-30|-20/-20:soft-knee=6:gain=0:volume=-90:delay=1",
                 "-af",
-                &*serde_json::from_str::<LoudnormStatsRaw>(LOUDNORM_STATS_RE.find(&buf).context("loudnorm stats failed")?.as_str())?.checked()?.into_audiofilter(),
+                &*serde_json::from_str::<LoudnormStats>(
+                    LOUDNORM_STATS_RE.find(&buf).context("loudnorm stats failed")?.as_str(),
+                )?
+                .into_audiofilter(),
                 //"-af",
                 //"silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=i=-16:lra=8:tp=0:dual_mono=true",
                 "-ar",
