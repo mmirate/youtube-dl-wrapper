@@ -1,4 +1,5 @@
 use anyhow::{bail, ensure, Context, Result};
+use derivative::*;
 use duct::cmd;
 use log::info;
 use rand::{self, thread_rng};
@@ -70,7 +71,7 @@ pub fn start(use_cookies: bool) -> Result<()> {
 
 pub trait JsonRpcSend: Serialize {
     type Out: serde::de::DeserializeOwned;
-    fn validate(&self, response: &Self::Out) -> Result<()>;
+    fn validate(&self, _response: &Self::Out) -> Result<()> { Ok(()) }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -245,36 +246,22 @@ pub enum DownloadStatus {
     Error,
     Complete,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Derivative)]
+#[derivative(PartialEq, PartialOrd, Eq, Ord)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Download {
     pub gid: Gid,
+    #[derivative(PartialEq="ignore", PartialOrd="ignore", Ord="ignore")]
     pub status: DownloadStatus,
+    #[derivative(PartialEq="ignore", PartialOrd="ignore", Ord="ignore")]
     #[serde(default)]
     pub error_code: String,
+    #[derivative(PartialEq="ignore", PartialOrd="ignore", Ord="ignore")]
     #[serde(default)]
     pub error_message: String,
 }
 impl Download {
-    const fn keys() -> &'static [&'static str; 4] {
-        &["gid", "status", "errorCode", "errorMessage"]
-    }
-}
-impl Eq for Download {}
-impl PartialEq for Download {
-    fn eq(&self, other: &Self) -> bool {
-        self.gid.eq(&other.gid)
-    }
-}
-impl PartialOrd for Download {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.gid.partial_cmp(&other.gid)
-    }
-}
-impl Ord for Download {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.gid.cmp(&other.gid)
-    }
+    const KEYS: &'static [&'static str; 4] = &["gid", "status", "errorCode", "errorMessage"];
 }
 
 #[derive(Debug, Serialize)]
@@ -287,15 +274,12 @@ impl TellStatusParams {
     pub(crate) fn new(gid: Gid) -> JsonRpcEnvelope<Self> {
         JsonRpcEnvelope::new(TellStatusParams {
             method: "aria2.tellStatus",
-            params: (&*ARIA2_TOKEN, gid, Download::keys()),
+            params: (&*ARIA2_TOKEN, gid, Download::KEYS),
         })
     }
 }
 impl JsonRpcSend for TellStatusParams {
     type Out = TellStatusResult;
-    fn validate(&self, _response: &Self::Out) -> Result<()> {
-        Ok(())
-    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,14 +294,11 @@ pub struct TellActiveParams {
 }
 impl TellActiveParams {
     pub fn new() -> JsonRpcEnvelope<Self> {
-        JsonRpcEnvelope::new(TellActiveParams { method: "aria2.tellActive", params: (&*ARIA2_TOKEN, Download::keys()) })
+        JsonRpcEnvelope::new(TellActiveParams { method: "aria2.tellActive", params: (&*ARIA2_TOKEN, Download::KEYS) })
     }
 }
 impl JsonRpcSend for TellActiveParams {
     type Out = TellActiveResult;
-    fn validate(&self, _response: &Self::Out) -> Result<()> {
-        Ok(())
-    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -334,15 +315,12 @@ impl TellStoppedParams {
     pub fn new() -> JsonRpcEnvelope<Self> {
         JsonRpcEnvelope::new(TellStoppedParams {
             method: "aria2.tellStopped",
-            params: (&*ARIA2_TOKEN, 0, 100_000, Download::keys()),
+            params: (&*ARIA2_TOKEN, 0, 100_000, Download::KEYS),
         })
     }
 }
 impl JsonRpcSend for TellStoppedParams {
     type Out = TellStoppedResult;
-    fn validate(&self, _response: &Self::Out) -> Result<()> {
-        Ok(())
-    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -359,15 +337,12 @@ impl TellWaitingParams {
     pub fn new() -> JsonRpcEnvelope<Self> {
         JsonRpcEnvelope::new(TellWaitingParams {
             method: "aria2.tellWaiting",
-            params: (&*ARIA2_TOKEN, 0, 100_000, Download::keys()),
+            params: (&*ARIA2_TOKEN, 0, 100_000, Download::KEYS),
         })
     }
 }
 impl JsonRpcSend for TellWaitingParams {
     type Out = TellWaitingResult;
-    fn validate(&self, _response: &Self::Out) -> Result<()> {
-        Ok(())
-    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

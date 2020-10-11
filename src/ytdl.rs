@@ -205,7 +205,6 @@ impl<'a> StartingPoint<'a> {
         }
         Ok(())
     }
-    #[allow(clippy::block_in_if_condition_stmt)]
     fn scrape(&mut self, rescrape: bool, use_cookies: bool) -> Result<()> {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&self.path) {
             Ok(out_file) => {
@@ -359,8 +358,6 @@ where
     output.serialize(serializer)
 }
 
-/*#[serde(flatten)] extra: HashMap<String, Value>,*/
-
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 struct UploaderDetails {
@@ -379,10 +376,11 @@ struct DiscriminantDetails {
     _type: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Derivative, Eq, PartialEq, PartialOrd, Ord, Deserialize, Serialize)]
+#[derivative(Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum Progress {
-    Unknown,
+    #[derivative(Default)] Unknown,
     Interrupted,
     Queued,
     Downloaded,
@@ -391,11 +389,6 @@ pub(crate) enum Progress {
 }
 impl Progress {
     pub(crate) const MAX: Progress = Progress::Recoded;
-}
-impl Default for Progress {
-    fn default() -> Self {
-        Progress::Unknown
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -436,7 +429,7 @@ struct TargetItemExt {
     age_limit: usize,
     annotations: Option<BTreeMap<String, ()>>,
     automatic_captions: BTreeMap<String, String>,
-    average_rating: Option<f64>, //Option<fixed::types::I4F60>,
+    average_rating: Option<f64>,
     channel_id: String,
     channel_url: String,
     categories: Option<Vec<String>>,
@@ -868,32 +861,40 @@ impl TargetItem {
         Ok(())
     }
     fn recode(&self) -> Result<()> {
+        let output_directory = Path::new("recoded");
+        let output_filename: PathBuf = {
+            let tmp: String = self.id.to_string();
+            let (head, tail) = tmp.split_at(tmp.len() - 8);
+            output_directory.join(head).join(format!("{}.mp3", tail))
+        };
         {
             let progress = self.progress.load();
             if progress < Progress::Remuxed {
                 warn!("tried to recode {} before it was remuxed, ignoring", self.id.to_string());
                 return Ok(());
-            } else if progress >= Progress::Recoded {
+            } else if progress >= Progress::Recoded && !output_filename.exists() {
                 warn!("tried to recode {} in duplicate, ignoring", self.id.to_string());
                 return Ok(());
             }
         }
         info!("recoding {}", self.id.to_string());
+        match std::fs::create_dir(output_directory) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            x => x,
+        }?;
         let input_filename: PathBuf =
             glob::glob(Path::new("remuxed").join(format!("{}.*", self.id.to_string())).as_path().try_to_str()?)?
                 .filter_map(Result::ok)
                 .next()
                 .with_context(|| format!("remux lost for {}", self.id.to_string()))?;
-        let output_filename: PathBuf = {
-            let tmp: String = self.id.to_string();
-            let (head, tail) = tmp.split_at(tmp.len() - 8);
-            Path::new("recoded").join(head).join(format!("{}.mp3", tail))
-        };
         if input_filename == output_filename {
             return Ok(());
         }
 
         static SILENCE_REMOVER: &'static str = "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02";
+        // two inferior alternate approaches:
+        const _LOUDNORM_ONEPASS: &str = "loudnorm=i=-16:lra=8:tp=0:dual_mono=true";
+        const _COMPAND: &str = "compand=attacks=.3|.3:decays=1|1:points=-90/-60|-60/-40|-40/-30|-20/-20:soft-knee=6:gain=0:volume=-90:delay=1";
         let ffmpeg_args_stats = &[
             "-y",
             "-nostats",
@@ -949,15 +950,11 @@ impl TargetItem {
                 "-hide_banner",
                 "-i",
                 input_filename.as_path().try_to_str()?,
-                //"-af",
-                //"compand=attacks=.3|.3:decays=1|1:points=-90/-60|-60/-40|-40/-30|-20/-20:soft-knee=6:gain=0:volume=-90:delay=1",
                 "-af",
                 &*serde_json::from_str::<LoudnormStats>(
                     LOUDNORM_STATS_RE.find(&buf).context("loudnorm stats failed")?.as_str(),
                 )?
                 .into_audiofilter(),
-                //"-af",
-                //"silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=i=-16:lra=8:tp=0:dual_mono=true",
                 "-ar",
                 "48000",
                 "-c",
@@ -1002,10 +999,10 @@ impl YoutubePlaylist {
         self.entries.is_empty()
     }
     pub(crate) fn expiry(&self) -> Option<DateTime<Utc>> {
-        self.entries.iter().flatten().map(|item| item.expiry()).flatten().max()
+        self.entries.par_iter().flatten().map(|item| item.expiry()).flatten().max()
     }
     pub(crate) fn progress(&self) -> Option<Progress> {
-        self.entries.par_iter().flatten().map(|t| t.progress.load()).min()
+        self.entries.par_iter().flatten().map(|item| item.progress.load()).min()
     }
 }
 
@@ -1024,13 +1021,13 @@ pub(crate) struct YoutubePlaylists {
 impl YoutubePlaylists {
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
-        self.entries.iter().map(YoutubePlaylist::len).sum()
+        self.entries.par_iter().map(YoutubePlaylist::len).sum()
     }
     pub(crate) fn is_empty(&self) -> bool {
-        self.entries.iter().all(YoutubePlaylist::is_empty)
+        self.entries.par_iter().all(YoutubePlaylist::is_empty)
     }
     pub(crate) fn expiry(&self) -> Option<DateTime<Utc>> {
-        self.entries.iter().map(YoutubePlaylist::expiry).flatten().max()
+        self.entries.par_iter().map(YoutubePlaylist::expiry).flatten().max()
     }
     pub(crate) fn progress(&self) -> Option<Progress> {
         self.entries.par_iter().map(YoutubePlaylist::progress).flatten().min()

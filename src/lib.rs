@@ -130,6 +130,11 @@ fn download_things(
 
     let item_index: dashmap::DashMap<ytdl::ItemId, ytdl::TargetItem> = dashmap::DashMap::new();
 
+    // use threads rather than async, because
+    // * some of the subtasks are cpu-heavy not i/o-heavy,
+    // * the cpu-heavy stuff must be concurrency-limited ,
+    // * the i/o-heavy stuff includes no server-side networking,
+    // * the i/o-heavy stuff mostly reaches out to a 3rd-party network service that is rate-limited anyhow.
     let postprocess_stop_requested = crossbeam_utils::atomic::AtomicCell::new(false);
     let poll_tick = crossbeam_channel::tick(Duration::from_secs(5));
     let enqueue_tick = crossbeam_channel::tick(Duration::from_millis(500));
@@ -172,7 +177,11 @@ fn download_things(
                                 ytdl::Progress::Downloaded => Some(&postprocess_tx),
                                 ytdl::Progress::Remuxed => Some(&postprocess_tx),
                                 ytdl::Progress::Recoded => None,
-                            }.map(|c| c.send(*r.key()).map_err(drop)).transpose()?.is_some() {
+                            }
+                            .map(|c| c.send(*r.key()).map_err(drop))
+                            .transpose()?
+                            .is_some()
+                            {
                                 itemcount.fetch_add(1);
                             }
                         }
@@ -215,38 +224,34 @@ fn download_things(
             borrow!(item_index);
             borrow!(postprocess_stop_requested);
             clone!(postprocess_rx);
-            rret.push(scope.builder().name(format!("postproc #{}", i + 1)).spawn(
-                move |_scope| -> Result<()> {
-                    if postprocess {
-                        for itemid in postprocess_rx {
-                            if postprocess_stop_requested.load() {
-                                return Ok(());
-                            }
-                            if let Some((_itemid, item)) = try_remove!(item_index, itemid).ok_but(|e| error!("{:?}", e))
-                            {
-                                item.postprocess().map_err(|e| {
-                                    postprocess_stop_requested.store(true);
-                                    e
-                                })?;
-                            }
+            rret.push(scope.builder().name(format!("postproc #{}", i + 1)).spawn(move |_scope| -> Result<()> {
+                if postprocess {
+                    for itemid in postprocess_rx {
+                        if postprocess_stop_requested.load() {
+                            return Ok(());
                         }
-                    } else {
-                        for itemid in postprocess_rx {
-                            if postprocess_stop_requested.load() {
-                                return Ok(());
-                            }
-                            if let Some((_itemid, item)) = try_remove!(item_index, itemid).ok_but(|e| error!("{:?}", e))
-                            {
-                                item.dump_metadata().map_err(|e| {
-                                    postprocess_stop_requested.store(true);
-                                    e
-                                })?;
-                            }
+                        if let Some((_itemid, item)) = try_remove!(item_index, itemid).ok_but(|e| error!("{:?}", e)) {
+                            item.postprocess().map_err(|e| {
+                                postprocess_stop_requested.store(true);
+                                e
+                            })?;
                         }
                     }
-                    Ok(())
-                },
-            )?);
+                } else {
+                    for itemid in postprocess_rx {
+                        if postprocess_stop_requested.load() {
+                            return Ok(());
+                        }
+                        if let Some((_itemid, item)) = try_remove!(item_index, itemid).ok_but(|e| error!("{:?}", e)) {
+                            item.dump_metadata().map_err(|e| {
+                                postprocess_stop_requested.store(true);
+                                e
+                            })?;
+                        }
+                    }
+                }
+                Ok(())
+            })?);
         }
         drop(postprocess_rx);
 
@@ -404,9 +409,8 @@ fn read_files<'o, 'i1: 'o, 'i2: 'o>(
 }
 
 fn parse_input_files<'a>(
-    tuple: (Vec<std::ops::Range<usize>>, &'a str),
+    (file_offsets, buffer): (Vec<std::ops::Range<usize>>, &'a str),
 ) -> impl ParallelIterator<Item = Result<ytdl::StartingPoint<'a>>> {
-    let (file_offsets, buffer) = tuple;
     file_offsets
         .into_par_iter()
         .flat_map(move |range: std::ops::Range<usize>| {
@@ -420,9 +424,8 @@ fn parse_input_files<'a>(
 }
 
 fn parse_ignore_files<'a>(
-    tuple: (Vec<std::ops::Range<usize>>, &'a str),
+    (file_offsets, buffer): (Vec<std::ops::Range<usize>>, &'a str),
 ) -> impl ParallelIterator<Item = Result<ytdl::ItemId>> + 'a {
-    let (file_offsets, buffer) = tuple;
     file_offsets
         .into_par_iter()
         .flat_map(move |range: std::ops::Range<usize>| {
@@ -447,7 +450,7 @@ struct Opt {
     /// use cookiejar
     #[structopt(short = "c", long)]
     use_cookies: bool,
-    /// change to directory DIR
+    /// work under directory DIR
     #[structopt(short = "C", long, name = "DIR", parse(from_os_str))]
     directory: Option<PathBuf>,
     /// list of IDs to ignore
@@ -467,7 +470,8 @@ pub fn main() -> Result<()> {
             *p = p.canonicalize()?;
             Ok(())
         })?;
-        opt.directory.take().map(std::env::set_current_dir).transpose()?;
+        Option::take(&mut opt.directory).map(std::env::set_current_dir).transpose()?;
+        // rust-analyzer bug: receiver-type of "opt.directory.take()" is misidentified
         opt
     };
 

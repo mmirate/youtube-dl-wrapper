@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 anyhow = "^1"
 base64 = "<2"
-base64-serde = "^0.5"
+base64-serde = "^0.6"
 chrono = { version = "^0.4", features = ["serde"] }
 crossbeam-channel = "^0.4"
 crossbeam-queue = "^0.2"
@@ -22,11 +22,12 @@ fs3 = "0.5"
 glob = "0.3"
 hex = { version = "^0.4", features = ["serde"] }
 itertools = "^0.9"
+jemallocator-global = "^0.3"
 kuchiki = "^0.8"
 log = "^0.4"
 num_cpus = "^1"
 once_cell = { version = "^1", features = ["parking_lot"] }
-parking_lot = { version = "^0.10", features = ["serde"] }
+parking_lot = { version = "^0.11", features = ["serde"] }
 rand = "^0.7"
 rayon = "^1"
 regex = "^1"
