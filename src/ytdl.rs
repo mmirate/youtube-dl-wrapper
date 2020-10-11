@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::URL_SAFE_NO_PAD;
 use chrono::prelude::*;
 use crossbeam_utils::atomic::AtomicCell;
-use derivative::Derivative;
+use derivative::*;  // star-import is to appease rust-analyzer
 use duct::cmd;
 use extension_trait::extension_trait;
 use kuchiki::traits::*;
@@ -197,7 +197,7 @@ impl<'a> StartingPoint<'a> {
             {
                 let lhs = correct_url.clone();
                 let rhs = std::mem::replace(&mut self.url, correct_url.into()).into_owned();
-                std::mem::replace(&mut self.tag, correct_tag);
+                self.tag = correct_tag;
                 info!("found shelf: {} => {}", lhs, rhs);
             } else {
                 bail!("couldn't find shelf for {:?} inside {}", self, text);
@@ -874,7 +874,6 @@ impl TargetItem {
             return Ok(());
         }
 
-        /*
         let ffmpeg_args_stats = &[
             "-y",
             "-nostats",
@@ -949,10 +948,10 @@ impl TargetItem {
                     self.input_i, self.input_lra, self.input_tp, self.input_thresh
                 )
             }
-        }*/
+        }
 
         let ffmpeg_args = {
-            //let buf = cmd("ffmpeg", ffmpeg_args_stats).stderr_to_stdout().read()?;
+            let buf = cmd("ffmpeg", ffmpeg_args_stats).stderr_to_stdout().read()?;
             &[
                 "-y",
                 "-nostats",
@@ -962,12 +961,16 @@ impl TargetItem {
                 input_filename.as_path().try_to_str()?,
                 //"-af",
                 //"compand=attacks=.3|.3:decays=1|1:points=-90/-60|-60/-40|-40/-30|-20/-20:soft-knee=6:gain=0:volume=-90:delay=1",
-                //"-af",
-                //&*serde_json::from_str::<LoudnormStatsRaw>(LOUDNORM_STATS_RE.find(&buf).context("loudnorm stats failed")?.as_str())?.checked()?.into_audiofilter(),
                 "-af",
-                "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=i=-16:lra=8:tp=0:dual_mono=true",
+                &*serde_json::from_str::<LoudnormStatsRaw>(LOUDNORM_STATS_RE.find(&buf).context("loudnorm stats failed")?.as_str())?.checked()?.into_audiofilter(),
+                //"-af",
+                //"silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02,loudnorm=i=-16:lra=8:tp=0:dual_mono=true",
                 "-ar",
                 "48000",
+                "-c",
+                "libmp3lame",
+                "-q:a",
+                "5",
                 &output_filename.as_path().try_to_str()?,
             ]
         };
