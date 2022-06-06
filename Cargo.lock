@@ -2273,7 +2273,7 @@ dependencies = [
  "chrono",
  "crossbeam-channel 0.4.4",
  "crossbeam-queue",
- "crossbeam-utils 0.7.2",
+ "crossbeam-utils 0.8.8",
  "ctrlc",
  "dashmap",
  "derivative",
