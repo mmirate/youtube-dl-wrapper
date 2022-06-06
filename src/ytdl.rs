@@ -196,9 +196,9 @@ impl<'a> StartingPoint<'a> {
                 })
             {
                 let lhs = correct_url.clone();
-                let rhs = std::mem::replace(&mut self.url, correct_url.into()).into_owned();
+                let rhs = std::mem::replace(&mut self.url, correct_url.into());
                 self.tag = correct_tag;
-                info!("found shelf: {} => {}", lhs, rhs);
+                info!("found shelf: {} => {}", lhs, &*rhs);
             } else {
                 bail!("couldn't find shelf for {:?} inside {}", self, text);
             }
@@ -251,8 +251,8 @@ fn youtube_dl_(url: &str, use_cookies: bool) -> duct::Expression {
     ret
 }
 
-fn youtube_dl_to_path(url: &str, out_file: &Path, use_cookies: bool) -> Result<()> {
-    Ok(youtube_dl_(url, use_cookies).unchecked().pipe(cmd!("ifne", "sponge", out_file)).run().map(drop)?)
+fn youtube_dl_to_path(url: &str, out_path: &Path, use_cookies: bool) -> Result<()> {
+    Ok(youtube_dl_(url, use_cookies).unchecked().pipe(cmd!("ifne", "sponge", out_path)).run().map(drop)?)
 }
 
 fn youtube_dl_to_file(url: &str, out_file: std::fs::File, use_cookies: bool) -> Result<()> {
@@ -268,12 +268,12 @@ pub struct ItemId(pub u64);
 impl std::str::FromStr for ItemId {
     type Err = anyhow::Error;
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let mut output: [u8; 8] = Default::default();
+        let mut output_bytes: [u8; 8] = Default::default();
         if input.len() != 11 {
             bail!("id must be 11 chars of base64");
         }
-        base64::decode_config_slice(input, URL_SAFE_NO_PAD, &mut output)?;
-        Ok(ItemId(u64::from_ne_bytes(output)))
+        base64::decode_config_slice(input, URL_SAFE_NO_PAD, &mut output_bytes)?;
+        Ok(ItemId(u64::from_ne_bytes(output_bytes)))
     }
 }
 impl ToString for ItemId {
@@ -295,14 +295,13 @@ impl<'de> Deserialize<'de> for ItemId {
         D: serde::de::Deserializer<'de>,
     {
         use serde::de::Error;
-        let mut output: [u8; 8] = Default::default();
+        let mut output_bytes: [u8; 8] = Default::default();
         let input: String = Deserialize::deserialize(deserializer)?;
-        // let input: Vec<u8> = serde_bytes::deserialize(deserializer)?;
         if input.len() != 11 {
             return Err(D::Error::custom("length of `id` must be 11"));
-        } //*/
-        base64::decode_config_slice(&input, URL_SAFE_NO_PAD, &mut output).map_err(D::Error::custom)?;
-        Ok(ItemId(u64::from_ne_bytes(output)))
+        }
+        base64::decode_config_slice(&input, URL_SAFE_NO_PAD, &mut output_bytes).map_err(D::Error::custom)?;
+        Ok(ItemId(u64::from_ne_bytes(output_bytes)))
     }
 }
 impl Serialize for ItemId {
@@ -312,10 +311,9 @@ impl Serialize for ItemId {
     {
         use serde::ser::Error;
         let input: [u8; 8] = self.0.to_ne_bytes();
-        let mut output: [u8; 11] = Default::default();
-        base64::encode_config_slice(&input, URL_SAFE_NO_PAD, &mut output);
-        // serde_bytes::serialize(&output[..], serializer)
-        serializer.serialize_str(std::str::from_utf8(&output).map_err(S::Error::custom)?)
+        let mut output_bytes: [u8; 11] = Default::default();
+        base64::encode_config_slice(&input, URL_SAFE_NO_PAD, &mut output_bytes);
+        serializer.serialize_str(std::str::from_utf8(&output_bytes).map_err(S::Error::custom)?)
     }
 }
 
@@ -329,7 +327,7 @@ where
         D: serde::de::Deserializer<'de>,
     {
         use serde::de::Error;
-        let input: String = Deserialize::deserialize(deserializer)?;
+        let input: &str = Deserialize::deserialize(deserializer)?;
         Ok(Parsed(input.parse().map_err(D::Error::custom)?))
     }
 }
@@ -346,16 +344,14 @@ fn deserialize_ac<'de, D, T: Deserialize<'de> + Copy>(deserializer: D) -> Result
 where
     D: serde::de::Deserializer<'de>,
 {
-    let input: T = Deserialize::deserialize(deserializer)?;
-    Ok(AtomicCell::new(input))
+    Ok(AtomicCell::new(Deserialize::deserialize(deserializer)?))
 }
 
 fn serialize_ac<S, T: Serialize + Copy>(output: &AtomicCell<T>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::ser::Serializer,
 {
-    let output: T = output.load();
-    output.serialize(serializer)
+    output.load().serialize(serializer)
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]

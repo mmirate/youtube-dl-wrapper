@@ -189,7 +189,7 @@ fn download_things(
                     }));
                     let itemcount = itemcount.into_inner();
                     if itemcount > 0 {
-                        spcount -= 1;
+                        spcount = spcount.saturating_sub(1);
                     }
                     info!("rfe'd {} items from {}", itemcount, sp.id);
                 }
@@ -329,7 +329,6 @@ fn download_things(
 
         rret.push(scope.builder().name("aria2 finished download reactor".to_owned()).spawn({
             borrow!(item_index);
-            moove!(poll_stopped_rx);
             moove!(poll_stopped_rx);
             moove!(postprocess_tx);
             move |_scope| {
