@@ -27,14 +27,14 @@ impl OsStrExt for OsStr {
         self.to_str().with_context(|| format!("not utf-8: {:?}", self))
     }
 }
-#[extension_trait(pub)]
-impl PathExt for Path {
+#[extension_trait]
+pub impl PathExt for Path {
     fn try_to_str(&self) -> Result<&str> {
         self.to_str().with_context(|| format!("not utf-8: {:?}", self))
     }
 }
-#[extension_trait(pub)]
-impl PathBufExt for PathBuf {
+#[extension_trait]
+pub impl PathBufExt for PathBuf {
     fn try_into_string(self) -> Result<String> {
         self.into_os_string().into_string().map_err(|e| anyhow!("not utf-8: {:?}", e))
     }
@@ -174,12 +174,12 @@ impl<'a> StartingPoint<'a> {
                                     if shelf_id != "0" {
                                         info!("Comparing {}", &url.as_str());
                                         info!(" ... with {}", self.url);
-                                        let other = StartingPoint::new(&url.as_str());
+                                        let other = StartingPoint::new(url.as_str());
                                         if let Ok(other) = other {
                                             if self.id == other.id {
                                                 if let StartingPointTag::Channel(Some(_)) = other.tag {
                                                     let correct_tag = other.tag;
-                                                    return Some((url.into_string(), correct_tag));
+                                                    return Some((String::from(url), correct_tag));
                                                 } else {
                                                     error!("{:?} has no shelf", other);
                                                 }
@@ -569,7 +569,7 @@ impl TargetItem {
         }?;
         Ok(())
     }
-    fn _refresh_if_needed<'s, 'g>(&'s self, cfg: &mut RwLockWriteGuard<'g, FormatDetails>) -> Result<()> {
+    fn _refresh_if_needed<'s>(&'s self, cfg: &mut RwLockWriteGuard<'_, FormatDetails>) -> Result<()> {
         use std::convert::TryInto;
         static CC_RE: once_cell::sync::Lazy<regex::Regex> =
             once_cell::sync::Lazy::new(|| regex::Regex::new(r#"max-age=([0-9]+)"#).unwrap());
@@ -738,7 +738,7 @@ impl TargetItem {
             metadata += self
                 .artist
                 .as_ref()
-                .or_else(|| self.creator.as_ref())
+                .or(self.creator.as_ref())
                 .unwrap_or(&self.uploader.uploader)
                 .trim_end_matches(" - Topic");
             metadata += "\0";
@@ -887,7 +887,7 @@ impl TargetItem {
             return Ok(());
         }
 
-        static SILENCE_REMOVER: &'static str = "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02";
+        static SILENCE_REMOVER: &str = "silenceremove=start_periods=1:start_duration=1:start_threshold=0.02:stop_periods=1:stop_duration=1:stop_threshold=0.02";
         // two inferior alternate approaches:
         const _LOUDNORM_ONEPASS: &str = "loudnorm=i=-16:lra=8:tp=0:dual_mono=true";
         const _COMPAND: &str = "compand=attacks=.3|.3:decays=1|1:points=-90/-60|-60/-40|-40/-30|-20/-20:soft-knee=6:gain=0:volume=-90:delay=1";
@@ -957,7 +957,7 @@ impl TargetItem {
                 "libmp3lame",
                 "-q:a",
                 "5",
-                &output_filename.as_path().try_to_str()?,
+                output_filename.as_path().try_to_str()?,
             ]
         };
 

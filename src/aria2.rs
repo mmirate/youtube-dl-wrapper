@@ -10,7 +10,7 @@ use crate::ytdl;
 
 static ARIA2_TOKEN: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| {
     use rand::distributions::Distribution;
-    "token:".chars().chain(rand::distributions::Alphanumeric.sample_iter(thread_rng()).take(33)).collect()
+    "token:".chars().chain(rand::distributions::Alphanumeric.sample_iter(thread_rng()).take(33).map(|x| x as char)).collect()
 });
 static ARIA2_URL: &str = "http://localhost:6800/jsonrpc";
 static RPC_CLIENT: once_cell::sync::Lazy<reqwest::blocking::Client> = once_cell::sync::Lazy::new(Default::default);

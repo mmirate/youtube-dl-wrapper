@@ -26,7 +26,7 @@ impl<T, U> OptionExtPair<T, U> for Option<T> {
 }
 #[extension_trait]
 impl<T, E> ResultExt<T, E> for std::result::Result<T, E> {
-    fn ok_but(self, f: impl FnOnce(E) -> ()) -> Option<T> {
+    fn ok_but(self, f: impl FnOnce(E)) -> Option<T> {
         match self {
             Ok(x) => Some(x),
             Err(x) => {
@@ -117,7 +117,7 @@ macro_rules! try_ok {
     };
 }
 
-#[allow(clippy::block_in_if_condition_stmt)]
+#[allow(clippy::blocks_in_if_conditions)]
 fn download_things(
     urls: Vec<ytdl::StartingPoint>, ignores: BTreeSet<ytdl::ItemId>, use_cookies: bool, postprocess: bool,
     limit: Option<usize>,
@@ -407,34 +407,38 @@ fn read_files<'o, 'i1: 'o, 'i2: 'o>(
     Ok((file_offsets, buffer.as_str()))
 }
 
-fn parse_input_files<'a>(
-    (file_offsets, buffer): (Vec<std::ops::Range<usize>>, &'a str),
-) -> impl ParallelIterator<Item = Result<ytdl::StartingPoint<'a>>> {
+fn parse_input_files(
+    (file_offsets, buffer): (Vec<std::ops::Range<usize>>, &str),
+) -> impl ParallelIterator<Item = Result<ytdl::StartingPoint<'_>>> {
     file_offsets
         .into_par_iter()
         .flat_map(move |range: std::ops::Range<usize>| {
             (&buffer[range])
                 .par_lines()
-                .filter_map(|s: &str| s.splitn(2, |c: char| "#;".contains(c)).next())
+                .filter_map(|s: &str| s.split(|c: char| "#;".contains(c)).next())
                 .filter_map(|s: &str| s.split_ascii_whitespace().last())
                 .filter(|s: &&str| !s.is_empty())
         })
         .map(ytdl::StartingPoint::new)
 }
 
-fn parse_ignore_files<'a>(
-    (file_offsets, buffer): (Vec<std::ops::Range<usize>>, &'a str),
-) -> impl ParallelIterator<Item = Result<ytdl::ItemId>> + 'a {
+fn parse_ignore_files(
+    (file_offsets, buffer): (Vec<std::ops::Range<usize>>, &str),
+) -> impl ParallelIterator<Item = Result<ytdl::ItemId>> + '_ {
     file_offsets
         .into_par_iter()
         .flat_map(move |range: std::ops::Range<usize>| {
             (&buffer[range])
                 .par_lines()
-                .filter_map(|s| s.splitn(2, |c: char| "#;".contains(c)).next())
-                .filter_map(|s| s.splitn(2, '.').next())
+                .filter_map(|s| {
+                    s.split_once(|c: char| "#;".contains(c)).map(|t| t.0).or(Some(s))
+                })
+                .filter_map(|s| {
+                    s.split_once('.').map(|t| t.0).or(Some(s))
+                })
                 .filter(|s: &&str| !s.is_empty())
         })
-        .map(|s| str::parse(s))
+        .map(str::parse)
 }
 
 #[derive(StructOpt, Debug)]

@@ -5,37 +5,37 @@ authors = ["Milo Mirate <mmirate@gmx.com>"]
 edition = "2018"
 
 [dependencies]
-anyhow = "^1"
+anyhow = "1"
 base64 = "<2"
-base64-serde = "^0.6"
-chrono = { version = "^0.4", features = ["serde"] }
-crossbeam-channel = "^0.4"
-crossbeam-queue = "^0.2"
-crossbeam-utils = "^0.7"
-ctrlc = { version = "^3", features = ["termination"] }
-dashmap = "3.11.1"
-derivative = "^2"
-duct = "^0.13"
-env_logger = "^0.7"
-extension-trait = "^0.2"
+base64-serde = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+crossbeam-queue = "0.3"
+crossbeam-utils = "0.8"
+ctrlc = { version = "3", features = ["termination"] }
+dashmap = "5.3"
+derivative = "2"
+duct = "0.13"
+env_logger = "0.9"
+extension-trait = "1"
 fs3 = "0.5"
 glob = "0.3"
-hex = { version = "^0.4", features = ["serde"] }
-itertools = "^0.9"
-jemallocator-global = "^0.3"
-kuchiki = "^0.8"
-log = "^0.4"
-num_cpus = "^1"
-once_cell = { version = "^1", features = ["parking_lot"] }
-parking_lot = { version = "^0.11", features = ["serde"] }
-rand = "^0.7"
-rayon = "^1"
-regex = "^1"
+hex = { version = "0.4", features = ["serde"] }
+itertools = "0.10"
+jemallocator-global = "0.3"
+kuchiki = "0.8"
+log = "0.4"
+num_cpus = "1"
+once_cell = { version = "1", features = ["parking_lot"] }
+parking_lot = { version = "0.12", features = ["serde"] }
+rand = "0.8"
+rayon = "1"
+regex = "1"
 regex-syntax = "*"
-reqwest = { version = "^0.10", default-features = false, features = ["json", "blocking", "gzip", "brotli", "rustls-tls"] }
-serde = { version = "^1", features = ["derive", "rc"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "blocking", "gzip", "brotli", "rustls-tls"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-structopt = "^0.3"
+structopt = "0.3"
 
 [profile.release]
 # panic = "abort"
