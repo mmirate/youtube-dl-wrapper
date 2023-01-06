@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use base64::URL_SAFE_NO_PAD;
+use base64::{alphabet::URL_SAFE, engine::fast_portable::NO_PAD};
 use chrono::prelude::*;
 use crossbeam_utils::atomic::AtomicCell;
 use derivative::*; // star-import is to appease rust-analyzer
@@ -16,6 +16,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+
+static URL_SAFE_NO_PAD: &'static base64::engine::fast_portable::FastPortable = &base64::engine::fast_portable::FastPortable::from(&URL_SAFE, NO_PAD);
 
 use crate::aria2;
 
@@ -272,7 +274,7 @@ impl std::str::FromStr for ItemId {
         if input.len() != 11 {
             bail!("id must be 11 chars of base64");
         }
-        base64::decode_config_slice(input, URL_SAFE_NO_PAD, &mut output_bytes)?;
+        base64::decode_engine_slice(input, &mut output_bytes, URL_SAFE_NO_PAD)?;
         Ok(ItemId(u64::from_ne_bytes(output_bytes)))
     }
 }
@@ -280,7 +282,7 @@ impl ToString for ItemId {
     fn to_string(&self) -> String {
         let input: [u8; 8] = self.0.to_ne_bytes();
         let mut output: [u8; 11] = Default::default();
-        base64::encode_config_slice(&input, URL_SAFE_NO_PAD, &mut output);
+        base64::encode_engine_slice(&input, &mut output, URL_SAFE_NO_PAD);
         String::from_utf8_lossy(&output).into_owned()
     }
 }
@@ -300,7 +302,7 @@ impl<'de> Deserialize<'de> for ItemId {
         if input.len() != 11 {
             return Err(D::Error::custom("length of `id` must be 11"));
         }
-        base64::decode_config_slice(&input, URL_SAFE_NO_PAD, &mut output_bytes).map_err(D::Error::custom)?;
+        base64::decode_engine_slice(&input, &mut output_bytes, URL_SAFE_NO_PAD).map_err(D::Error::custom)?;
         Ok(ItemId(u64::from_ne_bytes(output_bytes)))
     }
 }
@@ -312,7 +314,7 @@ impl Serialize for ItemId {
         use serde::ser::Error;
         let input: [u8; 8] = self.0.to_ne_bytes();
         let mut output_bytes: [u8; 11] = Default::default();
-        base64::encode_config_slice(&input, URL_SAFE_NO_PAD, &mut output_bytes);
+        base64::encode_engine_slice(&input, &mut output_bytes, URL_SAFE_NO_PAD);
         serializer.serialize_str(std::str::from_utf8(&output_bytes).map_err(S::Error::custom)?)
     }
 }
